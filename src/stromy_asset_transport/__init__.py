@@ -26,7 +26,7 @@ from .exceptions import DependencyError, StromyAssetTransportError
 from .keys import tenant_key
 from .store import AssetStore, AssetStoreError
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "AssetStore",
