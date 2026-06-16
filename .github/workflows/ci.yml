@@ -10,7 +10,7 @@ jobs:
   python-ci:
     uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
     with:
-      source_package: "stromy_asset_transport"
+      source_package: "src/stromy_asset_transport"
     # Forward the org stromy-ci App secrets (CI_APP_ID / CI_APP_PRIVATE_KEY)
     # so the reusable workflow can clone private deps. No-op if absent.
     secrets: inherit
