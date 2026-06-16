@@ -1,0 +1,30 @@
+# Notify stromy-org on push to main so it can auto-bump this submodule's pointer.
+#
+# Requires repo secret STROMY_ORG_DISPATCH_TOKEN: a fine-grained PAT with
+# `repository_dispatch: write` permission scoped to stromy-org/stromy-org.
+# Without the secret, the stromy-org daily cron will pick up the bump within
+# 24 hours instead (degraded but functional).
+name: Notify parent on push to main
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire submodule-bumped event into stromy-org
+        env:
+          GH_TOKEN: ${{ secrets.STROMY_ORG_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "STROMY_ORG_DISPATCH_TOKEN not set; relying on stromy-org daily cron fallback."
+            exit 0
+          fi
+          gh api repos/stromy-org/stromy-org/dispatches \
+            -f event_type=submodule-bumped \
+            -F "client_payload[submodule]=$REPO" \
+            -F "client_payload[sha]=$SHA"

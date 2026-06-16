@@ -1,0 +1,18 @@
+# Copier answers — DO NOT EDIT BY HAND.
+# Run `uvx copier update --skip-answered` to pull template improvements.
+_src_path: stromy-org/scaffolds/python-library-template
+author_email: william.masquelier@stromy.com.au
+author_name: William Masquelier
+consumer_repos_to_notify: stromy-format-mcp,media-gen-mcp,asset-broker-mcp
+depends_on_internal_libs: false
+description: Domain-agnostic content-addressed asset store and outbound delivery ladder
+    shared by Stromy MCP servers
+github_owner: stromy-org
+github_repo: asset-transport
+has_cli: false
+module_slug: stromy_asset_transport
+optional_extras: azure
+package_slug: stromy-asset-transport
+project_name: Asset Transport
+python_version: '3.11'
+surface_class: minimal

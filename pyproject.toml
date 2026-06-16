@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stromy-asset-transport"
+version = "0.1.0"
+description = "Domain-agnostic content-addressed asset store and outbound delivery ladder shared by Stromy MCP servers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "William Masquelier", email = "william.masquelier@stromy.com.au" }]
+dependencies = [
+    # Add your runtime dependencies here.
+]
+
+[project.optional-dependencies]
+# The Azure Blob backend for AssetStore (put/fetch) and the SAS download path in
+# delivery.deliver_artifact. Consumers that only use the local-filesystem backend
+# (tests/dev) or the SharePoint push path do NOT need this extra.
+azure = [
+    "azure-storage-blob>=12.19",
+    "azure-identity>=1.16",
+]
+all = ["stromy-asset-transport[azure]"]
+
+# PEP 735 dependency-groups — installed by default with `uv sync` (no --extra needed).
+# Azure is included here so pyright (strict) and the test suite can type-check and
+# exercise the Azure code paths locally and in CI, while staying an opt-in *runtime*
+# extra for consumers.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "pyright>=1.1",
+    "stromy-asset-transport[azure]",
+]
+
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stromy_asset_transport"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "PERF", "S", "E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src/stromy_asset_transport"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: Fast, isolated unit tests",
+    "contract: Public API contract stability tests",
+    "integration: End-to-end tests",
+    # Add `requires_<dep>` markers as you add optional-dependency-gated tests.
+]
