@@ -233,11 +233,25 @@ def test_deliver_artifact_empty_raises():
         raise AssertionError("expected ValueError on empty payload")
 
 
+def test_deliver_artifact_threads_subfolder_to_sharepoint(monkeypatch):
+    raw = b"x" * 4096
+    seen: dict[str, object] = {}
+
+    def _sp(raw, *, filename, subfolder=None):
+        seen["subfolder"] = subfolder
+        return {"delivered_via": "sharepoint-server", "web_url": "https://sp/s", "item_id": "i"}
+
+    monkeypatch.setattr(O, "deliver_to_sharepoint", _sp)
+    res = O.deliver_artifact(raw, filename="d.pptx", inline_max=1024, subfolder="Rebeca/2026-06")
+    assert res.mode == "sharepoint"
+    assert seen["subfolder"] == "Rebeca/2026-06"
+
+
 def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
     raw = b"x" * 4096
     monkeypatch.setattr(
         O, "deliver_to_sharepoint",
-        lambda raw, *, filename: {
+        lambda raw, *, filename, subfolder=None: {
             "delivered_via": "sharepoint-server",
             "web_url": "https://stromy.sharepoint.com/share/zzz",
             "drive_item_web_url": "https://stromy.sharepoint.com/item",
@@ -254,7 +268,7 @@ def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
 
 def test_deliver_artifact_falls_through_to_sas(monkeypatch, tmp_path):
     raw = b"y" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename: None)
+    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None: None)
     monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
     monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
     monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
@@ -303,7 +317,7 @@ def test_deliver_artifact_pushed_no_dual_link_when_disabled(monkeypatch, tmp_pat
 def test_deliver_artifact_none_when_no_backend_for_large(monkeypatch):
     """A large artifact with no URL backend is NOT inlined — mode 'none'."""
     raw = b"q" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename: None)
+    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None: None)
     for var in ("RENDER_OUTPUT_LOCAL_DIR", "ASSET_STORE_ACCOUNT", "ASSET_STORE_CONNECTION_STRING"):
         monkeypatch.delenv(var, raising=False)
     res = O.deliver_artifact(raw, filename="big.pdf", inline_max=1024)

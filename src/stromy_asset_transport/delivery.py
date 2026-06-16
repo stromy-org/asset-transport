@@ -116,6 +116,7 @@ def deliver_artifact(
     upload_kind: str = "graph-upload-session",
     total_size: int | None = None,
     dual_link: bool = True,
+    subfolder: str | None = None,
 ) -> DeliveryResult:
     """Deliver ``raw`` via the best available channel; never raise on a backend miss.
 
@@ -183,7 +184,7 @@ def deliver_artifact(
     #    reachable from a sandbox that blocks blob egress).
     if prefer_sharepoint:
         try:
-            sp = deliver_to_sharepoint(raw, filename=filename)
+            sp = deliver_to_sharepoint(raw, filename=filename, subfolder=subfolder)
         except OutputStoreError as e:
             warnings.append(f"sharepoint push failed: {e}")
             sp = None
