@@ -261,9 +261,10 @@ def test_deliver_artifact_falls_through_to_sas(monkeypatch, tmp_path):
     res = O.deliver_artifact(raw, filename="big.pdf", inline_max=1024)
     assert res.mode == "sas"
     assert res.download_url is not None and res.download_url.startswith("file://")
+    assert res.url_expires_at is not None
 
 
-def test_deliver_artifact_pushed_when_upload_url(monkeypatch):
+def test_deliver_artifact_pushed_when_upload_url_with_dual_link(monkeypatch, tmp_path):
     raw = b"z" * 100
     monkeypatch.setattr(
         O, "push_to_url",
@@ -271,18 +272,41 @@ def test_deliver_artifact_pushed_when_upload_url(monkeypatch):
             "delivered_via": kind, "web_url": "https://sp/x", "item_id": "id-1",
         },
     )
+    # A blob backend is present, so the pushed artifact also gets a SAS dual-link.
+    monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
+    monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
     res = O.deliver_artifact(raw, filename="d.pptx", inline_max=10, upload_url="https://upload")
     assert res.mode == "pushed"
     assert res.web_url == "https://sp/x"
     assert res.destination_item_id == "id-1"
+    assert res.delivered_via == "graph-upload-session"
+    # Dual link minted alongside the push destination.
+    assert res.download_url is not None and res.download_url.startswith("file://")
+    assert res.url_expires_at is not None
 
 
-def test_deliver_artifact_inline_last_resort_when_no_backend(monkeypatch):
+def test_deliver_artifact_pushed_no_dual_link_when_disabled(monkeypatch, tmp_path):
+    raw = b"z" * 100
+    monkeypatch.setattr(
+        O, "push_to_url",
+        lambda raw, *, upload_url, kind, total_size: {"delivered_via": kind, "web_url": "https://sp/x"},
+    )
+    monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
+    res = O.deliver_artifact(
+        raw, filename="d.pptx", inline_max=10, upload_url="https://upload", dual_link=False
+    )
+    assert res.mode == "pushed"
+    assert res.download_url is None and res.url_expires_at is None
+
+
+def test_deliver_artifact_none_when_no_backend_for_large(monkeypatch):
+    """A large artifact with no URL backend is NOT inlined — mode 'none'."""
     raw = b"q" * 4096
     monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename: None)
     for var in ("RENDER_OUTPUT_LOCAL_DIR", "ASSET_STORE_ACCOUNT", "ASSET_STORE_CONNECTION_STRING"):
         monkeypatch.delenv(var, raising=False)
     res = O.deliver_artifact(raw, filename="big.pdf", inline_max=1024)
-    assert res.mode == "inline"
-    assert res.inline_b64 == base64.b64encode(raw).decode("ascii")
-    assert any("no delivery backend" in w for w in res.warnings)
+    assert res.mode == "none"
+    assert res.inline_b64 is None
+    assert any("not delivered" in w for w in res.warnings)
