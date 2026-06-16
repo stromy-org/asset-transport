@@ -92,14 +92,16 @@ class DeliveryResult:
     succeeded), so the caller can surface a degraded delivery without failing.
     """
 
-    mode: str  # 'inline' | 'sharepoint' | 'sas' | 'pushed'
+    mode: str  # 'inline' | 'sharepoint' | 'sas' | 'pushed' | 'none'
     sha256: str
     size: int
     inline_b64: str | None = None
     download_url: str | None = None
+    url_expires_at: str | None = None
     web_url: str | None = None
     destination_url: str | None = None
     destination_item_id: str | None = None
+    delivered_via: str | None = None
     warnings: list[str] = field(default_factory=_empty_str_list)
 
 
@@ -113,15 +115,20 @@ def deliver_artifact(
     upload_url: str | None = None,
     upload_kind: str = "graph-upload-session",
     total_size: int | None = None,
+    dual_link: bool = True,
 ) -> DeliveryResult:
     """Deliver ``raw`` via the best available channel; never raise on a backend miss.
 
     Ladder: a caller-brokered ``upload_url`` push (if supplied) → inline base64
     when ``size <= inline_max`` → SharePoint push (when ``prefer_sharepoint``) →
     Azure Blob + SAS URL. If every URL backend is unconfigured for an
-    over-``inline_max`` artifact, the bytes are returned inline as a last resort
-    with a warning (the caller still gets the artifact and can fall back to a
-    server-local path). Raises only ``ValueError`` on empty input.
+    over-``inline_max`` artifact, the result is ``mode='none'`` (nothing delivered;
+    the caller substitutes its own server-local path) — large bytes are **never**
+    forced inline past ``inline_max``. Raises only ``ValueError`` on empty input.
+
+    When ``dual_link`` and a pushed artifact also has a blob backend, a short-lived
+    SAS ``download_url`` is minted alongside the push destination (best-effort), so
+    the caller can offer a browser-openable fallback next to the push target.
     """
     if not raw:
         raise ValueError("deliver_artifact: refusing to deliver empty bytes")
@@ -134,16 +141,33 @@ def deliver_artifact(
     if upload_url:
         try:
             pushed = push_to_url(raw, upload_url=upload_url, kind=upload_kind, total_size=total_size)
-            return DeliveryResult(
+        except OutputStoreError as e:
+            warnings.append(f"caller-brokered push failed: {e}; falling back to the download ladder")
+        else:
+            result = DeliveryResult(
                 mode="pushed",
                 sha256=sha,
                 size=size,
                 web_url=_as_str(pushed.get("web_url")),
                 destination_item_id=_as_str(pushed.get("item_id")),
+                delivered_via=_as_str(pushed.get("delivered_via")),
                 warnings=warnings,
             )
-        except OutputStoreError as e:
-            warnings.append(f"caller-brokered push failed: {e}; falling back to the download ladder")
+            # Dual link: also mint a SAS download fallback (best-effort) so a pushed
+            # artifact still has a browser-openable URL next to its push destination.
+            if dual_link:
+                try:
+                    dl = deliver(raw, sha=sha, filename=filename, ttl_seconds=ttl_seconds)
+                except OutputStoreError as e:
+                    warnings.append(
+                        f"pushed to destination, but the fallback download link could not "
+                        f"be minted ({e}); the push destination is fine"
+                    )
+                    dl = None
+                if dl is not None:
+                    result.download_url = _as_str(dl.get("download_url"))
+                    result.url_expires_at = _as_str(dl.get("url_expires_at"))
+            return result
 
     # 2. Inline small payloads — cheapest, no backend needed.
     if size <= inline_max:
@@ -171,6 +195,7 @@ def deliver_artifact(
                 web_url=_as_str(sp.get("web_url")),
                 destination_url=_as_str(sp.get("drive_item_web_url")),
                 destination_item_id=_as_str(sp.get("item_id")),
+                delivered_via=_as_str(sp.get("delivered_via")),
                 warnings=warnings,
             )
 
@@ -186,23 +211,19 @@ def deliver_artifact(
             sha256=sha,
             size=size,
             download_url=_as_str(sas.get("download_url")),
+            url_expires_at=_as_str(sas.get("url_expires_at")),
             warnings=warnings,
         )
 
-    # 5. No URL backend produced a link for an over-ceiling artifact. Return the
-    #    bytes inline as a last resort with a loud warning — the caller always
-    #    gets the artifact and can substitute a server-local path if it has one.
+    # 5. No URL backend produced a link for an over-ceiling artifact. Signal
+    #    'none' — the caller substitutes its own server-local path. A large
+    #    artifact is never forced inline (that is exactly the token-ceiling blow-up
+    #    the handle design exists to prevent).
     warnings.append(
-        f"no delivery backend configured; returning {size} bytes inline despite "
-        f"exceeding inline_max={inline_max}"
+        f"no delivery backend configured for a {size}-byte artifact over "
+        f"inline_max={inline_max}; not delivered (use a server-local path)"
     )
-    return DeliveryResult(
-        mode="inline",
-        sha256=sha,
-        size=size,
-        inline_b64=base64.b64encode(raw).decode("ascii"),
-        warnings=warnings,
-    )
+    return DeliveryResult(mode="none", sha256=sha, size=size, warnings=warnings)
 
 
 def _as_str(value: object) -> str | None:
