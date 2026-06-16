@@ -134,3 +134,54 @@ def test_put_no_backend_raises(tmp_path, monkeypatch):
     s = A.AssetStore()
     with pytest.raises(A.AssetStoreError, match="no asset-store backend"):
         s.put(b"bytes")
+
+
+# -- out-of-band upload session (large binaries, no inline base64) -----------------
+
+
+def _staging_path(upload_url: str):
+    from pathlib import Path as _Path
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+    return _Path(url2pathname(urlparse(upload_url).path))
+
+
+def test_upload_session_roundtrip(store):
+    s, backend = store
+    session = s.create_upload_url()
+    assert session["upload_url"].startswith("file://")
+    assert session["blob_key"] and session["expires_at"]
+    # Simulate the user's browser PUT: write bytes to the pre-authorized URL.
+    raw = b"large-brand-photo-\xff\x00" * 1000
+    _staging_path(str(session["upload_url"])).write_bytes(raw)
+
+    sha, size = s.finalize_upload(str(session["blob_key"]))
+    assert sha == hashlib.sha256(raw).hexdigest()
+    assert size == len(raw)
+    # The finalized blob is content-addressed in the backend and resolves via fetch.
+    assert (backend / sha).read_bytes() == raw
+    assert s.fetch(sha) == raw
+
+
+def test_finalize_upload_verifies_expected_digest(store):
+    s, _ = store
+    session = s.create_upload_url()
+    _staging_path(str(session["upload_url"])).write_bytes(b"the-actual-bytes")
+    wrong = hashlib.sha256(b"different").hexdigest()
+    with pytest.raises(A.AssetStoreError, match="expected"):
+        s.finalize_upload(str(session["blob_key"]), expected_sha256=wrong)
+
+
+def test_finalize_upload_missing_blob_raises(store):
+    s, _ = store
+    session = s.create_upload_url()  # never uploaded
+    with pytest.raises(A.AssetStoreError, match="missing or empty"):
+        s.finalize_upload(str(session["blob_key"]))
+
+
+def test_create_upload_url_no_backend_raises(tmp_path, monkeypatch):
+    for var in ("ASSET_STORE_LOCAL_DIR", "ASSET_STORE_ACCOUNT", "ASSET_STORE_CONNECTION_STRING"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(A, "DISK_CACHE_DIR", tmp_path / "cache")
+    with pytest.raises(A.AssetStoreError, match="no asset-store backend"):
+        A.AssetStore().create_upload_url()

@@ -32,14 +32,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import threading
 from collections import OrderedDict
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .exceptions import DependencyError
 
 DEFAULT_CONTAINER = "brand-assets"
+# Out-of-band uploads land under this prefix/subdir before finalize moves them to
+# their content-addressed key. Kept separate so a staged-but-unfinalized blob is
+# never mistaken for a resolvable handle.
+_STAGING_PREFIX = ".staging"
 DISK_CACHE_DIR = Path(os.environ.get("ASSET_STORE_CACHE_DIR", "/tmp/stromy-asset-cache"))  # noqa: S108
 # Bound the per-replica disk cache so a long-lived replica does not grow without
 # limit. Hot assets stay; cold ones are evicted LRU. Tunable via env.
@@ -120,6 +126,100 @@ class AssetStore:
         self._disk_put(key, data)
         self._mem_put(key, data)
         return key
+
+    def create_upload_url(
+        self, *, ttl_seconds: int = 3600, content_type: str | None = None
+    ) -> dict[str, object]:
+        """Mint a pre-authorized WRITE URL for an out-of-band upload to a staging blob.
+
+        Large inbound binaries can't ride the MCP tool-argument channel (the ~140 KB
+        ceiling), and the sandboxed agent can't egress to blob storage — so the
+        *user's browser* PUTs the bytes to ``upload_url`` directly, then
+        :meth:`finalize_upload` hashes them, moves them into the content-addressed
+        store at key = sha256, and deletes the staging blob. Returns
+        ``{upload_url, blob_key, expires_at}``; ``blob_key`` is the opaque staging
+        handle to pass back to :meth:`finalize_upload`.
+        """
+        blob_key = secrets.token_hex(16)
+        expires_at = (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat()
+
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            staging = Path(local_dir) / _STAGING_PREFIX
+            staging.mkdir(parents=True, exist_ok=True)
+            dest = staging / blob_key
+            return {"upload_url": dest.as_uri(), "blob_key": blob_key, "expires_at": expires_at}
+
+        svc, account_name = _build_azure_service()
+        if svc is None:
+            raise AssetStoreError(
+                "no asset-store backend configured for an upload session. Set "
+                "ASSET_STORE_LOCAL_DIR (tests/dev), ASSET_STORE_ACCOUNT (managed "
+                "identity), or ASSET_STORE_CONNECTION_STRING."
+            )
+        # content_type is recorded by the caller (broker); the write SAS itself does
+        # not pin it — the uploader sets Content-Type on its PUT.
+        _ = content_type
+        upload_url = _azure_write_sas(svc, account_name, blob_key, ttl_seconds=ttl_seconds)
+        return {"upload_url": upload_url, "blob_key": blob_key, "expires_at": expires_at}
+
+    def finalize_upload(self, blob_key: str, *, expected_sha256: str | None = None) -> tuple[str, int]:
+        """Move a staged out-of-band upload into the content-addressed store.
+
+        Reads the staging blob at ``blob_key``, hashes it → sha256, stores it under
+        that key (PUT-if-absent), deletes the staging blob, and returns
+        ``(sha256, size)``. Raises ``AssetStoreError`` if the staged blob is missing,
+        empty, or (when ``expected_sha256`` is given) does not match the digest.
+        """
+        if expected_sha256 is not None and not _is_sha256(expected_sha256.lower()):
+            raise AssetStoreError(f"not a valid sha256 handle: {expected_sha256!r}")
+        raw = self._staging_read(blob_key)
+        if not raw:
+            raise AssetStoreError(
+                f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?"
+            )
+        key = hashlib.sha256(raw).hexdigest()
+        if expected_sha256 is not None and key != expected_sha256.lower():
+            raise AssetStoreError(
+                f"staged upload {blob_key!r} hashes to sha256:{key} but expected "
+                f"sha256:{expected_sha256.lower()} (corrupt or wrong upload)"
+            )
+        self._backend_put(key, raw)
+        self._disk_put(key, raw)
+        self._mem_put(key, raw)
+        self._staging_delete(blob_key)
+        return key, len(raw)
+
+    def _staging_read(self, blob_key: str) -> bytes | None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            path = Path(local_dir) / _STAGING_PREFIX / blob_key
+            return path.read_bytes() if path.is_file() else None
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for upload finalize")
+        try:
+            blob = container.get_blob_client(f"{_STAGING_PREFIX}/{blob_key}")
+            return blob.download_blob().readall()
+        except Exception:  # noqa: BLE001 — missing staged blob → None (finalize raises)
+            return None
+
+    def _staging_delete(self, blob_key: str) -> None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            path = Path(local_dir) / _STAGING_PREFIX / blob_key
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        container = self._write_azure_container()
+        if container is None:
+            return
+        try:
+            container.get_blob_client(f"{_STAGING_PREFIX}/{blob_key}").delete_blob()
+        except Exception:  # noqa: BLE001, S110 — best-effort staging cleanup
+            pass
 
     # -- integrity ------------------------------------------------------------
 
@@ -275,19 +375,17 @@ def _blob_already_exists(exc: Exception) -> bool:
     return "BlobAlreadyExists" in str(exc) or name in {"ResourceExistsError", "ResourceModifiedError"}
 
 
-def _build_azure_container(*, read_only: bool) -> Any:
-    """Build an Azure container client from env, or return None if unconfigured.
+def _build_azure_service() -> tuple[Any, str | None]:
+    """Build ``(BlobServiceClient, account_name)`` from env, or ``(None, None)``.
 
     Shared backend-selection contract: account+managed-identity first, then
     connection string. Azure SDKs are imported lazily so non-Azure paths pay
-    nothing and the ``azure`` extra stays optional. The write path
-    (``read_only=False``) ensures the container exists.
+    nothing and the ``azure`` extra stays optional.
     """
     account = os.environ.get("ASSET_STORE_ACCOUNT")
     conn = os.environ.get("ASSET_STORE_CONNECTION_STRING")
-    container_name = os.environ.get("ASSET_STORE_CONTAINER", DEFAULT_CONTAINER)
     if not account and not conn:
-        return None
+        return None, None
 
     try:
         from azure.storage.blob import BlobServiceClient  # lazy
@@ -304,11 +402,22 @@ def _build_azure_container(*, read_only: bool) -> Any:
             account_url=f"https://{account}.blob.core.windows.net",
             credential=DefaultAzureCredential(),
         )
-    elif conn:
+        return svc, account
+    if conn:
         svc = BlobServiceClient.from_connection_string(conn)
-    else:  # unreachable: guarded above (account or conn is set)
-        return None
+        return svc, svc.account_name
+    return None, None  # unreachable: guarded above
 
+
+def _build_azure_container(*, read_only: bool) -> Any:
+    """Build an Azure container client from env, or return None if unconfigured.
+
+    The write path (``read_only=False``) ensures the container exists.
+    """
+    svc, _ = _build_azure_service()
+    if svc is None:
+        return None
+    container_name = os.environ.get("ASSET_STORE_CONTAINER", DEFAULT_CONTAINER)
     container = svc.get_container_client(container_name)
     if not read_only:
         try:
@@ -316,3 +425,53 @@ def _build_azure_container(*, read_only: bool) -> Any:
         except Exception:  # noqa: BLE001, S110 — already exists is the common case
             pass
     return container
+
+
+def _azure_write_sas(svc: Any, account_name: str | None, blob_key: str, *, ttl_seconds: int) -> str:
+    """Mint a short-lived WRITE SAS URL to a staging blob.
+
+    User-delegation SAS for the managed-identity backend (no account key on disk),
+    account-key SAS for a connection string — mirroring the outbound delivery SAS.
+    The user's browser PUTs to it; ``finalize_upload`` then content-addresses the
+    bytes.
+    """
+    if account_name is None:
+        raise AssetStoreError("could not resolve the storage account name for an upload SAS")
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # lazy
+
+    container_name = os.environ.get("ASSET_STORE_CONTAINER", DEFAULT_CONTAINER)
+    blob_name = f"{_STAGING_PREFIX}/{blob_key}"
+    container = svc.get_container_client(container_name)
+    try:
+        container.create_container()
+    except Exception:  # noqa: BLE001, S110 — already exists is the common case
+        pass
+    blob = container.get_blob_client(blob_name)
+
+    start = datetime.now(UTC) - timedelta(minutes=5)
+    expiry = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+    permission = BlobSasPermissions(write=True, create=True)
+
+    account_key = getattr(getattr(svc, "credential", None), "account_key", None)
+    if account_key:
+        sas = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            account_key=account_key,
+            permission=permission,
+            expiry=expiry,
+            start=start,
+        )
+    else:
+        udk = svc.get_user_delegation_key(start, expiry)
+        sas = generate_blob_sas(
+            account_name=account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=udk,
+            permission=permission,
+            expiry=expiry,
+            start=start,
+        )
+    return f"{blob.url}?{sas}"
