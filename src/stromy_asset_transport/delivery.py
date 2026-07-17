@@ -24,6 +24,10 @@ Backends (env, same selection contract as :mod:`store`):
   ASSET_STORE_ACCOUNT            -> Azure Blob via DefaultAzureCredential (upload + SAS)
   ASSET_STORE_CONNECTION_STRING  -> Azure Blob via connection string (account-key SAS)
   RENDER_SHAREPOINT_DRIVE_ID / _SITE_ID -> SharePoint push via managed identity
+
+The SharePoint env vars name one deployment-wide destination. A caller that
+needs a per-engagement destination passes an explicit :class:`SharePointTarget`,
+gated by the ``RENDER_SHAREPOINT_ALLOWED_SITES`` deny-by-default allowlist.
 """
 
 from __future__ import annotations
@@ -78,6 +82,91 @@ class OutputStoreError(RuntimeError):
     """Upload or SAS generation failed (no silent success over a missing file)."""
 
 
+@dataclass(frozen=True)
+class SharePointTarget:
+    """An explicit, caller-supplied SharePoint destination.
+
+    The env vars (``RENDER_SHAREPOINT_SITE_ID`` / ``_DRIVE_ID`` / ``_BASE_PATH``)
+    describe **one** deployment-wide destination. A target overrides them per
+    call, so a single server can deliver into per-engagement collaboration
+    spaces. This layer stays client-agnostic: it takes a resolved destination as
+    an argument and never learns *which client* it belongs to.
+
+    Contract:
+
+    ``site_id``
+        Required. The allowlist is matched against this, so a target without it
+        is refused (see :func:`_check_target_allowed`). Accepts either Graph
+        form: a path ref (``stromy.sharepoint.com:/sites/foo``) or a composite
+        id.
+    ``drive_id``
+        Optional performance shortcut that skips site→drive resolution. It MUST
+        belong to ``site_id`` — the allowlist gates the *site*, so a drive id
+        naming some other site is a caller bug, not something this layer can
+        detect.
+    ``base_path``
+        Root folder under the drive. ``None`` falls back to the env default
+        (``'Deliverables'``); ``''`` means *no* base folder, so ``subfolder``
+        resolves straight off the drive root.
+    ``link_mode``
+        ``'createLink'`` mints a sharing link (correct for an outbox whose
+        readers hold no direct permission). ``'webUrl'`` returns the item's own
+        URL — correct for a collaboration space, where members already have
+        access and a minted anonymous/org link would be both wrong and leaky.
+    """
+
+    site_id: str | None = None
+    drive_id: str | None = None
+    base_path: str | None = None
+    link_mode: str = "createLink"
+
+
+def _normalize_site_ref(ref: str) -> str:
+    """Canonicalise a site reference for allowlist comparison."""
+    return ref.strip().rstrip("/").lower()
+
+
+def _allowed_sites() -> set[str]:
+    """Parse ``RENDER_SHAREPOINT_ALLOWED_SITES`` into a comparable set.
+
+    Comma-separated. Entries are expected in the path form
+    (``host:/sites/name``) — the form the deployment already uses for
+    ``RENDER_SHAREPOINT_SITE_ID``. A *composite* Graph site id embeds commas and
+    therefore cannot be expressed here; that is deliberate rather than
+    unfortunate, because a mangled entry simply fails the match and the target is
+    refused (deny-by-default fails closed, never open).
+    """
+    raw = os.environ.get("RENDER_SHAREPOINT_ALLOWED_SITES") or ""
+    return {_normalize_site_ref(part) for part in raw.split(",") if part.strip()}
+
+
+def _check_target_allowed(target: SharePointTarget) -> None:
+    """Gate an explicit target against the site allowlist. Raise if not allowed.
+
+    Deny-by-default: an unset/empty allowlist refuses *every* explicit target and
+    leaves only the env default reachable. Raising (rather than silently ignoring
+    the target) is the point — ``deliver_artifact`` turns the raise into a warning
+    and drops to the SAS rung, so a mis-targeted render is never silently
+    delivered to the wrong tenant's space.
+    """
+    if not target.site_id:
+        raise OutputStoreError(
+            "SharePoint target must name a site (site_id); a drive-id-only target is "
+            "refused because a bare drive id bypasses the site allowlist boundary"
+        )
+    allowed = _allowed_sites()
+    if not allowed:
+        raise OutputStoreError(
+            "explicit SharePoint target refused: RENDER_SHAREPOINT_ALLOWED_SITES is unset "
+            "or empty (deny-by-default; only the env-default destination is reachable)"
+        )
+    if _normalize_site_ref(target.site_id) not in allowed:
+        raise OutputStoreError(
+            f"SharePoint target site {target.site_id!r} is not in "
+            "RENDER_SHAREPOINT_ALLOWED_SITES; refusing to deliver off-allowlist"
+        )
+
+
 def _mime_for(filename: str) -> str:
     return _MIME_BY_EXT.get(Path(filename).suffix.lower(), _DEFAULT_MIME)
 
@@ -117,6 +206,7 @@ def deliver_artifact(
     total_size: int | None = None,
     dual_link: bool = True,
     subfolder: str | None = None,
+    sharepoint_target: SharePointTarget | None = None,
 ) -> DeliveryResult:
     """Deliver ``raw`` via the best available channel; never raise on a backend miss.
 
@@ -184,7 +274,7 @@ def deliver_artifact(
     #    reachable from a sandbox that blocks blob egress).
     if prefer_sharepoint:
         try:
-            sp = deliver_to_sharepoint(raw, filename=filename, subfolder=subfolder)
+            sp = deliver_to_sharepoint(raw, filename=filename, subfolder=subfolder, target=sharepoint_target)
         except OutputStoreError as e:
             warnings.append(f"sharepoint push failed: {e}")
             sp = None
@@ -244,9 +334,7 @@ def push_to_url(
     """PUT bytes to a pre-authorized upload URL without our own credentials."""
     size = total_size if total_size is not None else len(raw)
     if size != len(raw):
-        raise OutputStoreError(
-            f"push_to_url size mismatch: payload is {len(raw)} bytes but total_size={size}"
-        )
+        raise OutputStoreError(f"push_to_url size mismatch: payload is {len(raw)} bytes but total_size={size}")
 
     parsed = urllib_parse.urlparse(upload_url)
     host = parsed.netloc or "unknown-host"
@@ -300,9 +388,7 @@ def push_to_url(
 # ── Azure Blob upload + SAS download URL ──────────────────────────────────────
 
 
-def deliver(
-    raw: bytes, *, sha: str, filename: str, ttl_seconds: int | None = None
-) -> dict[str, object] | None:
+def deliver(raw: bytes, *, sha: str, filename: str, ttl_seconds: int | None = None) -> dict[str, object] | None:
     """Upload bytes to the outputs container; return a download descriptor, or ``None``.
 
     Returns ``{"download_url", "url_expires_at", "blob"}`` on success. Returns
@@ -335,9 +421,7 @@ def deliver(
     if not account and not conn:
         return None
 
-    return _azure_deliver(
-        raw, blob_name=blob_name, filename=filename, ttl_seconds=ttl, account=account, conn=conn
-    )
+    return _azure_deliver(raw, blob_name=blob_name, filename=filename, ttl_seconds=ttl, account=account, conn=conn)
 
 
 def _azure_deliver(
@@ -392,13 +476,9 @@ def _azure_deliver(
 
     blob = container.get_blob_client(blob_name)
     try:
-        blob.upload_blob(
-            raw, overwrite=True, content_settings=ContentSettings(content_type=content_type)
-        )
+        blob.upload_blob(raw, overwrite=True, content_settings=ContentSettings(content_type=content_type))
     except Exception as e:  # noqa: BLE001
-        raise OutputStoreError(
-            f"failed to upload artifact to {container_name}/{blob_name}: {e}"
-        ) from e
+        raise OutputStoreError(f"failed to upload artifact to {container_name}/{blob_name}: {e}") from e
 
     # 5-minute backdated start tolerates clock skew between server and storage.
     start = datetime.now(UTC) - timedelta(minutes=5)
@@ -430,9 +510,7 @@ def _azure_deliver(
                 start=start,
             )
     except Exception as e:  # noqa: BLE001
-        raise OutputStoreError(
-            f"uploaded {container_name}/{blob_name} but failed to mint a SAS URL: {e}"
-        ) from e
+        raise OutputStoreError(f"uploaded {container_name}/{blob_name} but failed to mint a SAS URL: {e}") from e
 
     return {
         "download_url": f"{blob.url}?{sas}",
@@ -477,9 +555,7 @@ def _graph_request(
         detail = exc.read().decode("utf-8", "replace")[:500] if hasattr(exc, "read") else ""
         raise OutputStoreError(f"Graph {method} {url} → HTTP {exc.code}: {detail}") from exc
     except urllib_error.URLError as exc:
-        raise OutputStoreError(
-            f"Graph {method} {url} failed: {getattr(exc, 'reason', exc)}"
-        ) from exc
+        raise OutputStoreError(f"Graph {method} {url} failed: {getattr(exc, 'reason', exc)}") from exc
     if not body:
         return {}
     try:
@@ -502,6 +578,7 @@ def deliver_to_sharepoint(
     filename: str,
     subfolder: str | None = None,
     content_type: str | None = None,
+    target: SharePointTarget | None = None,
 ) -> dict[str, object] | None:
     """Push the artifact to a Stromy SharePoint library; return a durable share link.
 
@@ -511,14 +588,29 @@ def deliver_to_sharepoint(
     Optional:
       RENDER_SHAREPOINT_BASE_PATH  -> root folder under the drive (default 'Deliverables')
       RENDER_SHAREPOINT_LINK_SCOPE -> sharing-link scope: 'organization' (default) | 'anonymous'
+      RENDER_SHAREPOINT_ALLOWED_SITES -> comma-separated sites an explicit ``target`` may name
+
+    ``target`` (:class:`SharePointTarget`) overrides the env destination for this
+    call and is gated by the allowlist. It **replaces** the env destination
+    wholesale rather than merging with it: a target site combined with a leftover
+    env ``RENDER_SHAREPOINT_DRIVE_ID`` would otherwise upload to the env drive
+    while appearing to honour the target — a silent cross-client mis-delivery.
+    With ``target=None`` the behavior is byte-identical to the env-only original.
 
     Returns ``{"delivered_via","web_url","drive_item_web_url","item_id"}`` on
     success, or ``None`` when no SharePoint backend is configured (caller then
     continues down the download ladder). Raises ``OutputStoreError`` only when a
-    *configured* backend genuinely fails.
+    *configured* backend genuinely fails, or when ``target`` is off-allowlist.
     """
-    drive_id = os.environ.get("RENDER_SHAREPOINT_DRIVE_ID")
-    site_id = os.environ.get("RENDER_SHAREPOINT_SITE_ID")
+    if target is not None:
+        # Gate first: an off-allowlist target must never reach Graph at all.
+        _check_target_allowed(target)
+        # A target owns the destination outright — never fall back to env here.
+        drive_id = target.drive_id
+        site_id = target.site_id
+    else:
+        drive_id = os.environ.get("RENDER_SHAREPOINT_DRIVE_ID")
+        site_id = os.environ.get("RENDER_SHAREPOINT_SITE_ID")
     if not drive_id and not site_id:
         return None
 
@@ -539,8 +631,14 @@ def deliver_to_sharepoint(
         if not drive_id:
             raise OutputStoreError(f"could not resolve a default drive for site {site_id}")
 
-    base = _safe_segment(os.environ.get("RENDER_SHAREPOINT_BASE_PATH") or "Deliverables")
-    segments = [base]
+    # `None` -> env default; `''` -> deliberately no base folder (a collaboration
+    # space is already scoped by its site, so its tree hangs off the drive root).
+    # An *empty env var* stays falsy-defaulted to 'Deliverables' as it always was.
+    if target is not None and target.base_path is not None:
+        base_raw = target.base_path
+    else:
+        base_raw = os.environ.get("RENDER_SHAREPOINT_BASE_PATH") or "Deliverables"
+    segments = [_safe_segment(base_raw)] if base_raw.strip() else []
     if subfolder:
         segments += [_safe_segment(p) for p in subfolder.split("/") if p.strip()]
     folder_path = "/".join(segments)
@@ -557,9 +655,12 @@ def deliver_to_sharepoint(
     # A driveItem.webUrl is only openable by someone who already has access. The
     # client is external to the Stromy tenant, so mint a sharing link. Best-effort:
     # a failed link mint still returns the (org-internal) webUrl rather than nothing.
+    # `webUrl` mode opts out entirely: the readers are members of the target site,
+    # so the item's own URL resolves for them and no link needs minting.
     share_url = web_url
     scope = os.environ.get("RENDER_SHAREPOINT_LINK_SCOPE") or "organization"
-    if item_id:
+    link_mode = target.link_mode if target is not None else "createLink"
+    if item_id and link_mode != "webUrl":
         try:
             link = _graph_request(
                 f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink",
@@ -570,9 +671,7 @@ def deliver_to_sharepoint(
             )
             link_obj = link.get("link")
             link_web = (
-                _as_str(cast("dict[str, object]", link_obj).get("webUrl"))
-                if isinstance(link_obj, dict)
-                else None
+                _as_str(cast("dict[str, object]", link_obj).get("webUrl")) if isinstance(link_obj, dict) else None
             )
             if link_web:
                 share_url = link_web

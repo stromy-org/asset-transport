@@ -15,8 +15,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import cast
+from urllib import parse as urllib_parse
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+import pytest
 
 from stromy_asset_transport import delivery as O
 
@@ -165,9 +168,7 @@ def test_sharepoint_uploads_to_per_client_path_and_returns_share_link(monkeypatc
     calls: list[dict] = []
     monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
 
-    res = O.deliver_to_sharepoint(
-        b"deck-bytes", filename="strategy.pptx", subfolder="Stichting UPV Textiel/2026-06"
-    )
+    res = O.deliver_to_sharepoint(b"deck-bytes", filename="strategy.pptx", subfolder="Stichting UPV Textiel/2026-06")
     assert res is not None
     assert res["delivered_via"] == "sharepoint-server"
     assert res["web_url"] == "https://stromy.sharepoint.com/share/abc"
@@ -211,6 +212,146 @@ def test_sharepoint_falls_back_to_item_weburl_when_link_mint_fails(monkeypatch):
     assert res["web_url"] == "https://stromy.sharepoint.com/item-1"
 
 
+# ── deliver_to_sharepoint(target=…) : per-space targeting + allowlist ────────
+
+
+def _target_env(monkeypatch, allowed: str | None = "stromy.sharepoint.com:/sites/ai4comms-collab"):
+    """Env for explicit-target tests: a legacy env destination + an allowlist.
+
+    The env destination is deliberately left set so each test also proves the
+    target *overrides* it rather than merging with it.
+    """
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "legacy-env-drive")
+    monkeypatch.setenv("RENDER_SHAREPOINT_SITE_ID", "legacy-env-site")
+    monkeypatch.delenv("RENDER_SHAREPOINT_BASE_PATH", raising=False)
+    if allowed is None:
+        monkeypatch.delenv("RENDER_SHAREPOINT_ALLOWED_SITES", raising=False)
+    else:
+        monkeypatch.setenv("RENDER_SHAREPOINT_ALLOWED_SITES", allowed)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+
+
+def test_sharepoint_target_overrides_env_destination(monkeypatch):
+    """An allowlisted target wins over the env drive, and base_path='' drops the base."""
+    _target_env(monkeypatch)
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    res = O.deliver_to_sharepoint(
+        b"deck",
+        filename="brief.pdf",
+        subfolder="KVGO/Social Media Campaign/03 Deliverables",
+        target=O.SharePointTarget(
+            site_id="stromy.sharepoint.com:/sites/ai4comms-collab",
+            base_path="",
+        ),
+    )
+    assert res is not None
+    put = next(c for c in calls if c["method"] == "PUT")
+    # Resolved via the *target* site, never the env drive.
+    assert "legacy-env-drive" not in put["url"]
+    assert any("/sites/stromy.sharepoint.com:/sites/ai4comms-collab" in c["url"] for c in calls)
+    # base_path='' => no 'Deliverables/' prefix; tree hangs off the drive root.
+    assert "root:/KVGO/Social%20Media%20Campaign/03%20Deliverables/brief.pdf" in put["url"]
+    assert "Deliverables/KVGO" not in urllib_parse.unquote(put["url"])
+
+
+def test_sharepoint_target_weburl_mode_skips_createlink(monkeypatch):
+    _target_env(monkeypatch)
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    res = O.deliver_to_sharepoint(
+        b"deck",
+        filename="brief.pdf",
+        target=O.SharePointTarget(
+            site_id="stromy.sharepoint.com:/sites/ai4comms-collab",
+            link_mode="webUrl",
+        ),
+    )
+    assert res is not None
+    # No sharing link minted — members already hold direct permissions.
+    assert not any(c["url"].endswith("/createLink") for c in calls)
+    assert res["web_url"] == "https://stromy.sharepoint.com/item-1"
+    assert res["drive_item_web_url"] == "https://stromy.sharepoint.com/item-1"
+
+
+def test_sharepoint_target_off_allowlist_site_is_refused(monkeypatch):
+    _target_env(monkeypatch, allowed="stromy.sharepoint.com:/sites/duke-collab")
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    with pytest.raises(O.OutputStoreError, match="not in RENDER_SHAREPOINT_ALLOWED_SITES"):
+        O.deliver_to_sharepoint(
+            b"deck",
+            filename="brief.pdf",
+            target=O.SharePointTarget(site_id="stromy.sharepoint.com:/sites/other-client"),
+        )
+    assert calls == []  # refused before any Graph call
+
+
+def test_sharepoint_target_drive_id_only_is_refused(monkeypatch):
+    """A bare drive id would bypass the site boundary the allowlist enforces."""
+    _target_env(monkeypatch)
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    with pytest.raises(O.OutputStoreError, match="must name a site"):
+        O.deliver_to_sharepoint(b"deck", filename="brief.pdf", target=O.SharePointTarget(drive_id="some-drive"))
+    assert calls == []
+
+
+def test_sharepoint_target_refused_when_allowlist_unset(monkeypatch):
+    """Deny-by-default: no allowlist => explicit targets are unreachable."""
+    _target_env(monkeypatch, allowed=None)
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    with pytest.raises(O.OutputStoreError, match="unset or empty"):
+        O.deliver_to_sharepoint(
+            b"deck",
+            filename="brief.pdf",
+            target=O.SharePointTarget(site_id="stromy.sharepoint.com:/sites/ai4comms-collab"),
+        )
+    assert calls == []
+
+
+def test_sharepoint_allowlist_ignored_without_explicit_target(monkeypatch):
+    """Backward-compat: the env-default path is untouched by the allowlist."""
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.delenv("RENDER_SHAREPOINT_ALLOWED_SITES", raising=False)
+    monkeypatch.delenv("RENDER_SHAREPOINT_BASE_PATH", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert res is not None
+    put = next(c for c in calls if c["method"] == "PUT")
+    assert "/drives/drive-xyz/root:/Deliverables/d.pptx" in urllib_parse.unquote(put["url"])
+    assert res["web_url"] == "https://stromy.sharepoint.com/share/abc"  # createLink still minted
+
+
+def test_deliver_artifact_off_allowlist_target_warns_and_falls_to_sas(tmp_path, monkeypatch):
+    """The top risk: a mis-targeted render must degrade loudly, never mis-deliver."""
+    _target_env(monkeypatch, allowed="stromy.sharepoint.com:/sites/duke-collab")
+    monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
+    monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
+    monkeypatch.setattr(O, "_graph_request", _fake_graph([]))
+
+    res = O.deliver_artifact(
+        b"a-large-enough-payload",
+        filename="brief.pdf",
+        inline_max=0,
+        sharepoint_target=O.SharePointTarget(site_id="stromy.sharepoint.com:/sites/other-client"),
+    )
+    assert res.mode != "sharepoint"  # never silently delivered to the wrong space
+    assert any("other-client" in w for w in res.warnings)
+    assert any("sharepoint push failed" in w for w in res.warnings)
+
+
 # ── deliver_artifact() : the ladder ──────────────────────────────────────────
 
 
@@ -237,21 +378,40 @@ def test_deliver_artifact_threads_subfolder_to_sharepoint(monkeypatch):
     raw = b"x" * 4096
     seen: dict[str, object] = {}
 
-    def _sp(raw, *, filename, subfolder=None):
+    def _sp(raw, *, filename, subfolder=None, target=None):
         seen["subfolder"] = subfolder
+        seen["target"] = target
         return {"delivered_via": "sharepoint-server", "web_url": "https://sp/s", "item_id": "i"}
 
     monkeypatch.setattr(O, "deliver_to_sharepoint", _sp)
     res = O.deliver_artifact(raw, filename="d.pptx", inline_max=1024, subfolder="Rebeca/2026-06")
     assert res.mode == "sharepoint"
     assert seen["subfolder"] == "Rebeca/2026-06"
+    assert seen["target"] is None  # no target supplied => env-default path
+
+
+def test_deliver_artifact_threads_sharepoint_target(monkeypatch):
+    """deliver_artifact passes an explicit target straight through to the push."""
+    raw = b"x" * 4096
+    seen: dict[str, object] = {}
+
+    def _sp(raw, *, filename, subfolder=None, target=None):
+        seen["target"] = target
+        return {"delivered_via": "sharepoint-server", "web_url": "https://sp/s", "item_id": "i"}
+
+    monkeypatch.setattr(O, "deliver_to_sharepoint", _sp)
+    tgt = O.SharePointTarget(site_id="stromy.sharepoint.com:/sites/ai4comms-collab", base_path="")
+    res = O.deliver_artifact(raw, filename="d.pptx", inline_max=1024, sharepoint_target=tgt)
+    assert res.mode == "sharepoint"
+    assert seen["target"] is tgt
 
 
 def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
     raw = b"x" * 4096
     monkeypatch.setattr(
-        O, "deliver_to_sharepoint",
-        lambda raw, *, filename, subfolder=None: {
+        O,
+        "deliver_to_sharepoint",
+        lambda raw, *, filename, subfolder=None, target=None: {
             "delivered_via": "sharepoint-server",
             "web_url": "https://stromy.sharepoint.com/share/zzz",
             "drive_item_web_url": "https://stromy.sharepoint.com/item",
@@ -268,7 +428,7 @@ def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
 
 def test_deliver_artifact_falls_through_to_sas(monkeypatch, tmp_path):
     raw = b"y" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None: None)
+    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None: None)
     monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
     monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
     monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
@@ -281,9 +441,12 @@ def test_deliver_artifact_falls_through_to_sas(monkeypatch, tmp_path):
 def test_deliver_artifact_pushed_when_upload_url_with_dual_link(monkeypatch, tmp_path):
     raw = b"z" * 100
     monkeypatch.setattr(
-        O, "push_to_url",
+        O,
+        "push_to_url",
         lambda raw, *, upload_url, kind, total_size: {
-            "delivered_via": kind, "web_url": "https://sp/x", "item_id": "id-1",
+            "delivered_via": kind,
+            "web_url": "https://sp/x",
+            "item_id": "id-1",
         },
     )
     # A blob backend is present, so the pushed artifact also gets a SAS dual-link.
@@ -303,13 +466,12 @@ def test_deliver_artifact_pushed_when_upload_url_with_dual_link(monkeypatch, tmp
 def test_deliver_artifact_pushed_no_dual_link_when_disabled(monkeypatch, tmp_path):
     raw = b"z" * 100
     monkeypatch.setattr(
-        O, "push_to_url",
+        O,
+        "push_to_url",
         lambda raw, *, upload_url, kind, total_size: {"delivered_via": kind, "web_url": "https://sp/x"},
     )
     monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
-    res = O.deliver_artifact(
-        raw, filename="d.pptx", inline_max=10, upload_url="https://upload", dual_link=False
-    )
+    res = O.deliver_artifact(raw, filename="d.pptx", inline_max=10, upload_url="https://upload", dual_link=False)
     assert res.mode == "pushed"
     assert res.download_url is None and res.url_expires_at is None
 
@@ -317,7 +479,7 @@ def test_deliver_artifact_pushed_no_dual_link_when_disabled(monkeypatch, tmp_pat
 def test_deliver_artifact_none_when_no_backend_for_large(monkeypatch):
     """A large artifact with no URL backend is NOT inlined — mode 'none'."""
     raw = b"q" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None: None)
+    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None: None)
     for var in ("RENDER_OUTPUT_LOCAL_DIR", "ASSET_STORE_ACCOUNT", "ASSET_STORE_CONNECTION_STRING"):
         monkeypatch.delenv(var, raising=False)
     res = O.deliver_artifact(raw, filename="big.pdf", inline_max=1024)
