@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from .delivery import (
     DeliveryResult,
+    GraphRequestError,
     OutputStoreError,
+    SharePointLockedError,
     SharePointTarget,
     deliver,
     deliver_artifact,
@@ -27,14 +29,16 @@ from .exceptions import DependencyError, StromyAssetTransportError
 from .keys import tenant_key
 from .store import AssetStore, AssetStoreError
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "AssetStore",
     "AssetStoreError",
     "DeliveryResult",
     "DependencyError",
+    "GraphRequestError",
     "OutputStoreError",
+    "SharePointLockedError",
     "SharePointTarget",
     "StromyAssetTransportError",
     "deliver",

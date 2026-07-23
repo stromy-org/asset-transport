@@ -22,3 +22,10 @@ def test_core_public_api_present() -> None:
     for symbol in ("AssetStore", "deliver_artifact", "DeliveryResult", "tenant_key"):
         assert symbol in stromy_asset_transport.__all__
         assert hasattr(stromy_asset_transport, symbol)
+
+
+@pytest.mark.contract
+def test_sharepoint_lock_public_api_present() -> None:
+    for symbol in ("GraphRequestError", "SharePointLockedError"):
+        assert symbol in stromy_asset_transport.__all__
+        assert hasattr(stromy_asset_transport, symbol)
