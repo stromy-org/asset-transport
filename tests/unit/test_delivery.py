@@ -272,7 +272,7 @@ def test_sharepoint_lock_backoff_uses_exact_delays_then_succeeds(monkeypatch):
         return {}
 
     monkeypatch.setattr(O, "_graph_request", _impl)
-    monkeypatch.setattr(O.time, "sleep", sleeps.append)
+    monkeypatch.setattr(O, "_sleep", sleeps.append)
 
     result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
 
@@ -293,7 +293,7 @@ def test_exhausted_sharepoint_lock_returns_retryable_metadata_without_sas_or_del
         raise O.SharePointLockedError("locked", status_code=423, error_code="resourceLocked")
 
     monkeypatch.setattr(O, "_graph_request", _impl)
-    monkeypatch.setattr(O.time, "sleep", sleeps.append)
+    monkeypatch.setattr(O, "_sleep", sleeps.append)
     monkeypatch.setattr(
         O,
         "deliver",

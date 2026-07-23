@@ -58,6 +58,7 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # for any artifact under that (no upload session needed for the server push).
 _GRAPH_SIMPLE_PUT_LIMIT = 250 * 1024 * 1024
 _SHAREPOINT_LOCK_RETRY_DELAYS = (2.0, 5.0, 15.0)
+_sleep = time.sleep
 _MIME_BY_EXT = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -663,7 +664,7 @@ def _put_with_lock_retries(
                     error_code=exc.error_code,
                     attempts=attempts,
                 ) from exc
-            time.sleep(_SHAREPOINT_LOCK_RETRY_DELAYS[attempts - 1])
+            _sleep(_SHAREPOINT_LOCK_RETRY_DELAYS[attempts - 1])
 
 
 def _safe_segment(name: str) -> str:
