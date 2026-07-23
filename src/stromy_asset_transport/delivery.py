@@ -36,6 +36,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +57,8 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # Simple Graph PUT to .../content uploads up to 250 MiB; a single PUT is enough
 # for any artifact under that (no upload session needed for the server push).
 _GRAPH_SIMPLE_PUT_LIMIT = 250 * 1024 * 1024
+_SHAREPOINT_LOCK_RETRY_DELAYS = (2.0, 5.0, 15.0)
+_sleep = time.sleep
 _MIME_BY_EXT = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -80,6 +83,36 @@ def _empty_str_list() -> list[str]:
 
 class OutputStoreError(RuntimeError):
     """Upload or SAS generation failed (no silent success over a missing file)."""
+
+
+class GraphRequestError(OutputStoreError):
+    """Graph rejected a request, preserving machine-readable failure details."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
+
+class SharePointLockedError(GraphRequestError):
+    """SharePoint refused an upload because the destination item is locked."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(message, status_code=status_code, error_code=error_code)
+        self.attempts = attempts
 
 
 @dataclass(frozen=True)
@@ -191,6 +224,9 @@ class DeliveryResult:
     destination_url: str | None = None
     destination_item_id: str | None = None
     delivered_via: str | None = None
+    failure_code: str | None = None
+    retryable: bool = False
+    attempts: int | None = None
     warnings: list[str] = field(default_factory=_empty_str_list)
 
 
@@ -275,6 +311,20 @@ def deliver_artifact(
     if prefer_sharepoint:
         try:
             sp = deliver_to_sharepoint(raw, filename=filename, subfolder=subfolder, target=sharepoint_target)
+        except SharePointLockedError as e:
+            warnings.append(
+                "SharePoint kept the destination locked after "
+                f"{e.attempts} attempts; keep the local artifact and retry after the editor closes it"
+            )
+            return DeliveryResult(
+                mode="none",
+                sha256=sha,
+                size=size,
+                failure_code="sharepoint_locked",
+                retryable=True,
+                attempts=e.attempts,
+                warnings=warnings,
+            )
         except OutputStoreError as e:
             warnings.append(f"sharepoint push failed: {e}")
             sp = None
@@ -552,8 +602,21 @@ def _graph_request(
         with urllib_request.urlopen(req) as resp:  # noqa: S310
             body = resp.read()
     except urllib_error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:500] if hasattr(exc, "read") else ""
-        raise OutputStoreError(f"Graph {method} {url} → HTTP {exc.code}: {detail}") from exc
+        raw_detail = exc.read() if hasattr(exc, "read") else b""
+        detail = raw_detail.decode("utf-8", "replace")[:500]
+        error_code = _graph_error_code(raw_detail)
+        message = f"Graph {method} {url} → HTTP {exc.code}: {detail}"
+        if exc.code == 423 or (error_code or "").lower() == "resourcelocked":
+            raise SharePointLockedError(
+                message,
+                status_code=exc.code,
+                error_code=error_code,
+            ) from exc
+        raise GraphRequestError(
+            message,
+            status_code=exc.code,
+            error_code=error_code,
+        ) from exc
     except urllib_error.URLError as exc:
         raise OutputStoreError(f"Graph {method} {url} failed: {getattr(exc, 'reason', exc)}") from exc
     if not body:
@@ -563,6 +626,45 @@ def _graph_request(
     except json.JSONDecodeError:
         return {}
     return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
+
+
+def _graph_error_code(body: bytes) -> str | None:
+    """Extract ``error.code`` from a Graph error body without masking the HTTP error."""
+    try:
+        parsed: object = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error = cast("dict[str, object]", parsed).get("error")
+    if not isinstance(error, dict):
+        return None
+    code = cast("dict[str, object]", error).get("code")
+    return code if isinstance(code, str) else None
+
+
+def _put_with_lock_retries(
+    url: str,
+    *,
+    token: str,
+    data: bytes,
+    content_type: str,
+) -> dict[str, object]:
+    """Retry only SharePoint lock contention, using the bounded protocol delays."""
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return _graph_request(url, token=token, method="PUT", data=data, content_type=content_type)
+        except SharePointLockedError as exc:
+            if attempts > len(_SHAREPOINT_LOCK_RETRY_DELAYS):
+                raise SharePointLockedError(
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_code=exc.error_code,
+                    attempts=attempts,
+                ) from exc
+            _sleep(_SHAREPOINT_LOCK_RETRY_DELAYS[attempts - 1])
 
 
 def _safe_segment(name: str) -> str:
@@ -647,7 +749,7 @@ def deliver_to_sharepoint(
     ctype = content_type or _mime_for(filename)
     encoded_path = urllib_parse.quote(item_path)
     upload_url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}:/content"
-    item = _graph_request(upload_url, token=token, method="PUT", data=raw, content_type=ctype)
+    item = _put_with_lock_retries(upload_url, token=token, data=raw, content_type=ctype)
 
     item_id = _as_str(item.get("id"))
     web_url = _as_str(item.get("webUrl"))

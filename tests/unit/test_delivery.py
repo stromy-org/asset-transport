@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import cast
+from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib.parse import urlparse
 from urllib.request import url2pathname
@@ -210,6 +212,127 @@ def test_sharepoint_falls_back_to_item_weburl_when_link_mint_fails(monkeypatch):
     res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
     assert res is not None
     assert res["web_url"] == "https://stromy.sharepoint.com/item-1"
+
+
+def _http_error(status: int, body: dict[str, object]) -> urllib_error.HTTPError:
+    return urllib_error.HTTPError(
+        "https://graph.microsoft.com/upload",
+        status,
+        "Graph error",
+        {},
+        io.BytesIO(json.dumps(body).encode("utf-8")),
+    )
+
+
+def test_graph_recognizes_sharepoint_lock_by_423_status(monkeypatch):
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        lambda _request: (_ for _ in ()).throw(_http_error(423, {"error": {"code": "unknown"}})),
+    )
+
+    with pytest.raises(O.SharePointLockedError) as caught:
+        O._graph_request("https://graph.microsoft.com/upload", token=str(), method="PUT", data=b"x")
+
+    assert caught.value.status_code == 423
+    assert caught.value.error_code == "unknown"
+
+
+def test_graph_recognizes_sharepoint_resource_locked_by_body(monkeypatch):
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        lambda _request: (_ for _ in ()).throw(
+            _http_error(409, {"error": {"code": "ResourceLocked", "message": "open elsewhere"}})
+        ),
+    )
+
+    with pytest.raises(O.SharePointLockedError) as caught:
+        O._graph_request("https://graph.microsoft.com/upload", token=str(), method="PUT", data=b"x")
+
+    assert caught.value.status_code == 409
+    assert caught.value.error_code == "ResourceLocked"
+
+
+def test_sharepoint_lock_backoff_uses_exact_delays_then_succeeds(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    sleeps: list[float] = []
+    calls: list[str] = []
+
+    def _impl(url, *, token, method="GET", data=None, content_type=None):
+        calls.append(method)
+        if method == "PUT" and calls.count("PUT") < 4:
+            raise O.SharePointLockedError("locked", status_code=423, error_code="resourceLocked")
+        if method == "PUT":
+            return {"id": "item-1", "webUrl": "https://stromy.sharepoint.com/item-1"}
+        if method == "POST":
+            return {"link": {"webUrl": "https://stromy.sharepoint.com/share/abc"}}
+        return {}
+
+    monkeypatch.setattr(O, "_graph_request", _impl)
+    monkeypatch.setattr(O, "_sleep", sleeps.append)
+
+    result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+
+    assert result is not None
+    assert calls.count("PUT") == 4
+    assert sleeps == [2.0, 5.0, 15.0]
+
+
+def test_exhausted_sharepoint_lock_returns_retryable_metadata_without_sas_or_delete(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    methods: list[str] = []
+    sleeps: list[float] = []
+
+    def _impl(url, *, token, method="GET", data=None, content_type=None):
+        methods.append(method)
+        raise O.SharePointLockedError("locked", status_code=423, error_code="resourceLocked")
+
+    monkeypatch.setattr(O, "_graph_request", _impl)
+    monkeypatch.setattr(O, "_sleep", sleeps.append)
+    monkeypatch.setattr(
+        O,
+        "deliver",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SAS fallback must not run")),
+    )
+
+    result = O.deliver_artifact(b"large", filename="d.pptx", inline_max=0)
+
+    assert result.mode == "none"
+    assert result.failure_code == "sharepoint_locked"
+    assert result.retryable is True
+    assert result.attempts == 4
+    assert methods == ["PUT", "PUT", "PUT", "PUT"]
+    assert "DELETE" not in methods
+    assert sleeps == [2.0, 5.0, 15.0]
+    assert any("retry after the editor closes it" in warning for warning in result.warnings)
+
+
+def test_non_lock_graph_failure_still_falls_back_to_sas(monkeypatch, tmp_path):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    monkeypatch.setattr(
+        O,
+        "_graph_request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            O.GraphRequestError("precondition failed", status_code=412, error_code="preconditionFailed")
+        ),
+    )
+    monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
+    monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
+    monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
+
+    result = O.deliver_artifact(b"large", filename="d.pptx", inline_max=0)
+
+    assert result.mode == "sas"
+    assert result.failure_code is None
+    assert result.download_url is not None
+    assert any("precondition failed" in warning for warning in result.warnings)
 
 
 # ── deliver_to_sharepoint(target=…) : per-space targeting + allowlist ────────
