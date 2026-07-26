@@ -37,15 +37,16 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from .exceptions import DependencyError
+from .exceptions import DependencyError, StromyAssetTransportError
 
 DEFAULT_OUTPUT_CONTAINER = "brand-outputs"
 # 24h: the SAS link is opened by a *human* (the sandbox can't egress to blob
@@ -583,15 +584,65 @@ def _graph_token() -> str:
     return cred.get_token("https://graph.microsoft.com/.default").token
 
 
-def _graph_request(
+@dataclass(frozen=True)
+class GraphResponse:
+    """One Graph HTTP response, retaining what the workspace primitives need.
+
+    ``_graph_request`` (the original write path) only ever needed the parsed JSON
+    body, so it discarded status, headers and raw bytes. The immutable workspace
+    ledger needs all three: the **status** distinguishes "created" from
+    "already exists" without guessing, the **headers** carry ``Retry-After`` on a
+    lock/throttle, and the **bytes** are the file content itself.
+
+    Deliberately NOT a generic escape hatch: ``_graph_call`` accepts a fixed set of
+    request shapes and no caller-supplied header dict, so no caller can smuggle an
+    ``If-Match`` (or any other) header through this layer. Conditional *content*
+    replacement is not part of the supported Graph upload contract and is not
+    offered here — the ledger is create-only instead.
+    """
+
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+    @property
+    def json(self) -> dict[str, object]:
+        """The parsed JSON object body, or ``{}`` when empty/non-object."""
+        if not self.body:
+            return {}
+        try:
+            parsed: object = json.loads(self.body)
+        except json.JSONDecodeError:
+            return {}
+        return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
+
+    def header(self, name: str) -> str | None:
+        """Case-insensitive header lookup (HTTP header names are case-insensitive)."""
+        lowered = name.lower()
+        for key, value in self.headers.items():
+            if key.lower() == lowered:
+                return value
+        return None
+
+
+def _graph_call(
     url: str,
     *,
     token: str,
     method: str = "GET",
     data: bytes | None = None,
     content_type: str | None = None,
-) -> dict[str, object]:
-    """Issue one Graph request and return the parsed JSON body (``{}`` if empty)."""
+) -> GraphResponse:
+    """Issue one Graph request and return the full response, status included.
+
+    This is the low-level primitive: an HTTP error status is **returned**, not
+    raised, because the workspace layer treats several of them as ordinary
+    control flow (404 probes for existence, 409 is the create-only conflict,
+    423/429 drive the bounded contention retry). Only a transport failure raises.
+
+    :func:`_graph_request` is the raising wrapper the write path uses, so the
+    established "any 4xx/5xx is an exception" contract is unchanged there.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
         headers["Content-Type"] = content_type
@@ -600,32 +651,51 @@ def _graph_request(
     req = urllib_request.Request(url, data=data, headers=headers, method=method)  # noqa: S310
     try:
         with urllib_request.urlopen(req) as resp:  # noqa: S310
-            body = resp.read()
+            status = int(getattr(resp, "status", resp.getcode()) or 0)
+            return GraphResponse(status=status, headers=dict(resp.headers.items()), body=resp.read())
     except urllib_error.HTTPError as exc:
-        raw_detail = exc.read() if hasattr(exc, "read") else b""
-        detail = raw_detail.decode("utf-8", "replace")[:500]
-        error_code = _graph_error_code(raw_detail)
-        message = f"Graph {method} {url} → HTTP {exc.code}: {detail}"
-        if exc.code == 423 or (error_code or "").lower() == "resourcelocked":
-            raise SharePointLockedError(
-                message,
-                status_code=exc.code,
-                error_code=error_code,
-            ) from exc
-        raise GraphRequestError(
-            message,
-            status_code=exc.code,
-            error_code=error_code,
-        ) from exc
+        body = exc.read() if hasattr(exc, "read") else b""
+        raw_headers = getattr(exc, "headers", None)
+        exc_headers = dict(raw_headers.items()) if raw_headers is not None else {}
+        return GraphResponse(status=exc.code, headers=exc_headers, body=body)
     except urllib_error.URLError as exc:
         raise OutputStoreError(f"Graph {method} {url} failed: {getattr(exc, 'reason', exc)}") from exc
-    if not body:
-        return {}
-    try:
-        parsed: object = json.loads(body)
-    except json.JSONDecodeError:
-        return {}
-    return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
+
+
+def _graph_request(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    data: bytes | None = None,
+    content_type: str | None = None,
+) -> dict[str, object]:
+    """Issue one Graph request and return the parsed JSON body (``{}`` if empty).
+
+    The write path's helper, now a thin raising wrapper over :func:`_graph_call`.
+    Its contract is unchanged — a lock still surfaces as
+    :class:`SharePointLockedError` and every other error status as
+    :class:`GraphRequestError`, both carrying the machine-readable status/code.
+    """
+    resp = _graph_call(url, token=token, method=method, data=data, content_type=content_type)
+    if resp.status >= 400:
+        raise _graph_error_for(resp, method=method, url=url)
+    return resp.json
+
+
+def _graph_error_for(resp: GraphResponse, *, method: str, url: str) -> GraphRequestError:
+    """Build the typed error for an error-status Graph response."""
+    detail = resp.body.decode("utf-8", "replace")[:500]
+    error_code = _graph_error_code(resp.body)
+    message = f"Graph {method} {url} → HTTP {resp.status}: {detail}"
+    if _is_locked(resp):
+        return SharePointLockedError(message, status_code=resp.status, error_code=error_code)
+    return GraphRequestError(message, status_code=resp.status, error_code=error_code)
+
+
+def _is_locked(resp: GraphResponse) -> bool:
+    """True when the response is SharePoint lock contention (not mere throttling)."""
+    return resp.status == 423 or (_graph_error_code(resp.body) or "").lower() == "resourcelocked"
 
 
 def _graph_error_code(body: bytes) -> str | None:
@@ -786,3 +856,506 @@ def deliver_to_sharepoint(
         "drive_item_web_url": web_url,
         "item_id": item_id,
     }
+
+
+# ── workspace storage: safe read / list / create-only Drive primitives ─────────
+#
+# The delivery ladder above is WRITE-ONLY: it PUTs bytes and returns a link. A
+# durable, client-readable project record needs three more shapes — read one
+# small file, list a bounded set of children, and create a file/folder that must
+# never clobber an existing one. These primitives supply exactly those and
+# nothing else.
+#
+# What is deliberately ABSENT:
+#   * no `update_file` and no `If-Match` on content. Graph's supported small-file
+#     upload endpoint documents create-or-REPLACE and no conditional content
+#     header, so a "read-modify-write with a 412 retry" would be built on an
+#     undocumented guarantee — and a lost update there would silently rewrite a
+#     record a client can read. The ledger is immutable + content-addressed
+#     instead, which makes a retry a no-op rather than a race.
+#   * no arbitrary-header escape hatch (see GraphResponse).
+#   * no client policy. This layer takes a resolved SharePointTarget and validated
+#     path segments; it never learns which client it belongs to, never reads
+#     client-data, and never decides where a workspace lives.
+
+
+class WorkspaceStorageError(StromyAssetTransportError):
+    """Base for the workspace-storage primitives' typed failures."""
+
+
+class TargetNotAllowed(WorkspaceStorageError):
+    """The target site is not on ``RENDER_SHAREPOINT_ALLOWED_SITES`` (deny-by-default)."""
+
+
+class UnsafePath(WorkspaceStorageError, ValueError):
+    """A path segment is not a single, safe, relative path component."""
+
+
+class FileNotFound(WorkspaceStorageError):
+    """The addressed drive item does not exist."""
+
+
+class IdempotencyCollision(WorkspaceStorageError):
+    """A file already exists at this create-only path with DIFFERENT content.
+
+    The create-only contract is "the same key writes the same bytes exactly once".
+    Same key + same digest is a replay and succeeds; same key + different digest
+    means two callers derived different content for one identity, which is a
+    caller bug that must surface rather than silently overwrite a client-readable
+    record.
+    """
+
+
+#: Statuses that mean "someone else holds it / slow down", i.e. worth retrying.
+#: The bounded policy itself (`_SHAREPOINT_LOCK_RETRY_DELAYS`: 2s, 5s, 15s across
+#: at most four attempts) and the `_sleep` seam are shared with the write path —
+#: one contention policy for the whole library, not a second dialect here.
+_CONTENTION_STATUSES = frozenset({423, 429, 503})
+#: Read ceiling for a ledger record. Events and the index are small by contract;
+#: a larger file at one of those paths is a signal, not something to stream.
+DEFAULT_READ_MAX_BYTES = 1024 * 1024
+#: Hard cap on one `list_children` page, independent of what the caller asks for.
+LIST_CHILDREN_MAX_LIMIT = 200
+
+_MAX_SEGMENT_LEN = 255
+_SEGMENT_ILLEGAL = set('\\/:*?"<>|')
+
+
+def _validate_segment(segment: str) -> str:
+    """Return ``segment`` if it is ONE safe relative path component, else raise.
+
+    Strict by design (unlike :func:`_safe_segment`, which coerces): a caller that
+    hands us ``..``, an absolute path, or an embedded slash has a bug, and
+    silently rewriting it into a *different* valid path is how an artifact gets
+    filed somewhere nobody asked for. Escaping the allowlisted target is refused
+    here, before the allowlist is even consulted.
+    """
+    if not isinstance(segment, str) or not segment:  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise UnsafePath("path segment must be a non-empty string")
+    if len(segment) > _MAX_SEGMENT_LEN:
+        raise UnsafePath(f"path segment is longer than {_MAX_SEGMENT_LEN} characters")
+    if any(c in _SEGMENT_ILLEGAL for c in segment):
+        raise UnsafePath(f"path segment {segment!r} contains a SharePoint-illegal character")
+    if any(ord(c) < 0x20 for c in segment):
+        raise UnsafePath("path segment contains a control character")
+    if segment != segment.strip() or segment.startswith(".") or segment.endswith("."):
+        raise UnsafePath(
+            f"path segment {segment!r} starts or ends with whitespace or a dot "
+            "(this also rejects the '.' and '..' traversal segments)"
+        )
+    return segment
+
+
+def _validate_segments(segments: Iterable[str]) -> tuple[str, ...]:
+    return tuple(_validate_segment(s) for s in segments)
+
+
+@dataclass(frozen=True)
+class SharePointFileRef:
+    """One drive item addressed relative to a target's base path.
+
+    ``path`` is a *relative* POSIX path whose every component was validated as a
+    single safe segment at construction. Build it with :meth:`of` rather than
+    assembling a string, so no unvalidated separator can sneak in.
+    """
+
+    target: SharePointTarget
+    path: PurePosixPath
+
+    @classmethod
+    def of(cls, target: SharePointTarget, *segments: str) -> SharePointFileRef:
+        """Build a ref from individually validated segments."""
+        validated = _validate_segments(segments)
+        if not validated:
+            raise UnsafePath("a file ref needs at least one path segment")
+        return cls(target=target, path=PurePosixPath(*validated))
+
+    @property
+    def segments(self) -> tuple[str, ...]:
+        return tuple(self.path.parts)
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+@dataclass(frozen=True)
+class DriveItemInfo:
+    """The subset of a Graph driveItem the workspace layer needs.
+
+    ``download_url`` is deliberately absent: the short-lived preauthenticated URL
+    never leaves this module (see :func:`read_file`). Handing it to an MCP caller
+    would export an unauthenticated, forwardable read capability on a client's
+    document library.
+    """
+
+    id: str
+    name: str
+    etag: str | None
+    web_url: str | None
+    created_at: str | None
+    is_folder: bool
+    size: int | None = None
+
+
+def _as_int(value: object) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _item_info(payload: dict[str, object]) -> DriveItemInfo:
+    return DriveItemInfo(
+        id=_as_str(payload.get("id")) or "",
+        name=_as_str(payload.get("name")) or "",
+        etag=_as_str(payload.get("eTag")),
+        web_url=_as_str(payload.get("webUrl")),
+        created_at=_as_str(payload.get("createdDateTime")),
+        is_folder="folder" in payload,
+        size=_as_int(payload.get("size")),
+    )
+
+
+def _require_allowed(target: SharePointTarget) -> None:
+    """Allowlist gate for every workspace primitive — always the FIRST thing run."""
+    try:
+        _check_target_allowed(target)
+    except OutputStoreError as e:
+        raise TargetNotAllowed(str(e)) from e
+
+
+def _base_segments(target: SharePointTarget) -> tuple[str, ...]:
+    """The target's root folder, split into validated segments (possibly empty).
+
+    Same precedence as :func:`deliver_to_sharepoint`: an explicit ``base_path``
+    wins (``''`` meaning *drive root*), otherwise the env default. Coerced with
+    :func:`_safe_segment` rather than rejected, because this value is deployment
+    configuration that already governs the existing write path — tightening it
+    here would change where established deliveries land.
+    """
+    if target.base_path is not None:
+        base_raw = target.base_path
+    else:
+        base_raw = os.environ.get("RENDER_SHAREPOINT_BASE_PATH") or "Deliverables"
+    return tuple(_safe_segment(p) for p in base_raw.split("/") if p.strip())
+
+
+def _resolve_drive_id(target: SharePointTarget, token: str) -> str:
+    """Resolve the target's drive id, preferring the caller-supplied shortcut."""
+    if target.drive_id:
+        return target.drive_id
+    site = _graph_request(f"{_GRAPH_BASE}/sites/{target.site_id}", token=token)
+    resolved_site = site.get("id") or target.site_id
+    drive = _graph_request(f"{_GRAPH_BASE}/sites/{resolved_site}/drive", token=token)
+    drive_id = _as_str(drive.get("id"))
+    if not drive_id:
+        raise GraphRequestError(f"could not resolve a default drive for site {target.site_id}")
+    return drive_id
+
+
+def _path_url(drive_id: str, segments: Sequence[str], *, suffix: str = "") -> str:
+    """Build a path-addressed drive URL: ``/drives/{id}/root:/a/b{suffix}``.
+
+    With no segments the item IS the drive root, which has no ``root:/…:`` form.
+    """
+    if not segments:
+        return f"{_GRAPH_BASE}/drives/{drive_id}/root{suffix}"
+    encoded = urllib_parse.quote("/".join(segments))
+    return f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:{suffix}" if suffix else (
+        f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}"
+    )
+
+
+def _retry_after_seconds(resp: GraphResponse) -> float | None:
+    raw = resp.header("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw.strip()))
+    except ValueError:
+        return None  # HTTP-date form: fall back to the fixed schedule
+
+
+def _call_with_contention_retry(
+    describe: str,
+    call: Callable[[], GraphResponse],
+) -> GraphResponse:
+    """Run ``call``, retrying only genuine contention/throttle statuses.
+
+    Honours a server-advertised ``Retry-After`` when present, else the same
+    bounded 2/5/15s schedule the write path uses (four attempts max). When the
+    budget is exhausted a lock raises :class:`SharePointLockedError` — the type
+    ``deliver_artifact`` already maps to ``failure_code="sharepoint_locked"``,
+    so contention has ONE meaning across the library — and a pure throttle
+    raises :class:`GraphRequestError`. Either way nothing was written: an honest
+    "not yet", never an unbounded wait and never a silent success.
+    """
+    last: GraphResponse | None = None
+    for attempt in range(len(_SHAREPOINT_LOCK_RETRY_DELAYS) + 1):
+        resp = call()
+        if resp.status not in _CONTENTION_STATUSES:
+            return resp
+        last = resp
+        if attempt < len(_SHAREPOINT_LOCK_RETRY_DELAYS):
+            advertised = _retry_after_seconds(resp)
+            _sleep(advertised if advertised is not None else _SHAREPOINT_LOCK_RETRY_DELAYS[attempt])
+    attempts = len(_SHAREPOINT_LOCK_RETRY_DELAYS) + 1
+    assert last is not None  # noqa: S101 - the loop only exits here after a response
+    message = (
+        f"{describe} stayed locked/throttled after {attempts} attempts; deferring "
+        "(nothing was written)"
+    )
+    error_code = _graph_error_code(last.body)
+    if _is_locked(last):
+        raise SharePointLockedError(
+            message, status_code=last.status, error_code=error_code, attempts=attempts
+        )
+    raise GraphRequestError(message, status_code=last.status, error_code=error_code)
+
+
+def get_file_metadata(ref: SharePointFileRef) -> DriveItemInfo:
+    """Return the drive item's metadata (including its eTag).
+
+    Raises :class:`TargetNotAllowed` before any Graph call for an off-allowlist
+    target, and :class:`FileNotFound` when the item does not exist.
+    """
+    _require_allowed(ref.target)
+    token = _graph_token()
+    drive_id = _resolve_drive_id(ref.target, token)
+    url = _path_url(drive_id, (*_base_segments(ref.target), *ref.segments))
+    resp = _call_with_contention_retry(f"metadata read of {ref.path}", lambda: _graph_call(url, token=token))
+    if resp.status == 404:
+        raise FileNotFound(str(ref.path))
+    if resp.status >= 400:
+        raise GraphRequestError(
+            f"metadata read of {ref.path} → HTTP {resp.status}", status_code=resp.status
+        )
+    return _item_info(resp.json)
+
+
+def read_file(ref: SharePointFileRef, *, max_bytes: int = DEFAULT_READ_MAX_BYTES) -> bytes:
+    """Read a small file's bytes.
+
+    Graph serves content by redirecting to a short-lived **preauthenticated** URL.
+    That URL is a bearer capability in itself, so this function fetches metadata
+    first, uses the returned ``@microsoft.graph.downloadUrl`` **without** an
+    Authorization header (forwarding our token to a redirect target is how a
+    credential leaks), and never returns or logs the URL.
+    """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    _require_allowed(ref.target)
+    token = _graph_token()
+    drive_id = _resolve_drive_id(ref.target, token)
+    url = _path_url(drive_id, (*_base_segments(ref.target), *ref.segments))
+    resp = _call_with_contention_retry(f"read of {ref.path}", lambda: _graph_call(url, token=token))
+    if resp.status == 404:
+        raise FileNotFound(str(ref.path))
+    if resp.status >= 400:
+        raise GraphRequestError(f"read of {ref.path} → HTTP {resp.status}", status_code=resp.status)
+
+    payload = resp.json
+    size = _as_int(payload.get("size"))
+    if size is not None and size > max_bytes:
+        raise GraphRequestError(
+            f"{ref.path} is {size} bytes, over the {max_bytes}-byte read ceiling"
+        )
+    download_url = _as_str(payload.get("@microsoft.graph.downloadUrl"))
+    if not download_url:
+        raise GraphRequestError(f"{ref.path} exposed no download URL (is it a folder?)")
+
+    # No Authorization header: the URL is already preauthenticated, and attaching
+    # our app token to a non-Graph host would export it.
+    req = urllib_request.Request(download_url, method="GET")  # noqa: S310
+    try:
+        with urllib_request.urlopen(req) as content:  # noqa: S310
+            data = content.read(max_bytes + 1)
+    except urllib_error.HTTPError as exc:
+        raise GraphRequestError(
+            f"content read of {ref.path} → HTTP {exc.code}", status_code=exc.code
+        ) from exc
+    except urllib_error.URLError as exc:
+        # Deliberately does not interpolate the URL — it is a live credential.
+        raise GraphRequestError(f"content read of {ref.path} failed") from exc
+    if len(data) > max_bytes:
+        raise GraphRequestError(f"{ref.path} exceeds the {max_bytes}-byte read ceiling")
+    return data
+
+
+def list_children(
+    target: SharePointTarget,
+    parent: Sequence[str] = (),
+    *,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> tuple[list[DriveItemInfo], str | None]:
+    """List one bounded page of a folder's children.
+
+    Returns ``(items, next_cursor)``. ``next_cursor`` is Graph's opaque
+    ``@odata.nextLink``; pass it back to continue. A cursor pointing anywhere
+    other than the Graph host is refused — a caller-supplied continuation URL is
+    otherwise a request-forgery primitive.
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    limit = min(limit, LIST_CHILDREN_MAX_LIMIT)
+    _require_allowed(target)
+    token = _graph_token()
+
+    if cursor is not None:
+        parsed = urllib_parse.urlparse(cursor)
+        if parsed.scheme != "https" or parsed.netloc != "graph.microsoft.com":
+            raise UnsafePath("pagination cursor must be a Microsoft Graph https URL")
+        url = cursor
+    else:
+        segments = (*_base_segments(target), *_validate_segments(parent))
+        url = _path_url(_resolve_drive_id(target, token), segments, suffix="/children")
+        url = f"{url}?$top={limit}"
+
+    resp = _call_with_contention_retry("listing children", lambda: _graph_call(url, token=token))
+    if resp.status == 404:
+        raise FileNotFound("/".join(parent) or "<root>")
+    if resp.status >= 400:
+        raise GraphRequestError(f"listing children → HTTP {resp.status}", status_code=resp.status)
+
+    payload = resp.json
+    raw_values = payload.get("value")
+    values = cast("list[object]", raw_values) if isinstance(raw_values, list) else []
+    items = [_item_info(cast("dict[str, object]", v)) for v in values if isinstance(v, dict)]
+    if len(items) > limit:
+        # `$top` (carried into every nextLink) should make this impossible. If it
+        # ever happens, fail loudly: silently slicing would drop items the cursor
+        # can never return, which reads as "that is the whole history".
+        raise GraphRequestError(
+            f"listing returned {len(items)} children over the requested limit of {limit}"
+        )
+    return items, _as_str(payload.get("@odata.nextLink"))
+
+
+def ensure_folder(target: SharePointTarget, segments: Sequence[str]) -> DriveItemInfo | None:
+    """Create the folder chain under the target's base path if it is missing.
+
+    Walks the chain one level at a time. A level that already exists is verified
+    to be a **folder** (a file sitting where a folder belongs is a hard error, not
+    something to route around). A missing level is created with
+    ``conflictBehavior: fail``; a 409 means a concurrent caller won the race, so
+    the level is re-resolved and verified rather than re-created.
+
+    ``rename`` is never used: silently creating ``02 Working 1`` next to
+    ``02 Working`` would misfile a client's artifact into a folder they will never
+    look in. Returns the deepest folder's info, or ``None`` for an empty chain.
+    """
+    _require_allowed(target)
+    validated = _validate_segments(segments)
+    if not validated:
+        return None
+    token = _graph_token()
+    drive_id = _resolve_drive_id(target, token)
+    base = _base_segments(target)
+
+    parent_id: str | None = None
+    current: DriveItemInfo | None = None
+    for depth, segment in enumerate(validated, start=1):
+        chain = (*base, *validated[:depth])
+        probe_url = _path_url(drive_id, chain)
+        probe = _call_with_contention_retry(
+            f"probing folder {segment!r}", lambda url=probe_url: _graph_call(url, token=token)
+        )
+        if probe.status == 200:
+            current = _item_info(probe.json)
+            if not current.is_folder:
+                raise GraphRequestError(
+                    f"{'/'.join(chain)} exists but is a file; refusing to file a "
+                    "deliverable under it"
+                )
+            parent_id = current.id
+            continue
+        if probe.status != 404:
+            raise GraphRequestError(
+                f"probing {'/'.join(chain)} → HTTP {probe.status}", status_code=probe.status
+            )
+
+        if parent_id:
+            # Address the parent by the id the probe just returned.
+            create_url = f"{_GRAPH_BASE}/drives/{drive_id}/items/{parent_id}/children"
+        else:
+            # First level: the parent is the target's base folder (or the drive
+            # root when the target declares no base path).
+            create_url = _path_url(drive_id, base, suffix="/children")
+        body = json.dumps(
+            {"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+        ).encode("utf-8")
+        created = _call_with_contention_retry(
+            f"creating folder {segment!r}",
+            lambda url=create_url, payload=body: _graph_call(
+                url, token=token, method="POST", data=payload, content_type="application/json"
+            ),
+        )
+        if created.status == 409:
+            # Lost the race — re-resolve and verify it really is a folder.
+            reprobe = _call_with_contention_retry(
+                f"re-probing folder {segment!r}", lambda url=probe_url: _graph_call(url, token=token)
+            )
+            if reprobe.status != 200:
+                raise GraphRequestError(
+                    f"folder {'/'.join(chain)} reported a conflict but could not be resolved "
+                    f"(HTTP {reprobe.status})"
+                )
+            current = _item_info(reprobe.json)
+            if not current.is_folder:
+                raise GraphRequestError(f"{'/'.join(chain)} exists but is a file")
+        elif created.status >= 400:
+            raise GraphRequestError(
+                f"creating {'/'.join(chain)} → HTTP {created.status}", status_code=created.status
+            )
+        else:
+            current = _item_info(created.json)
+        parent_id = current.id
+    return current
+
+
+def create_file_once(
+    ref: SharePointFileRef,
+    data: bytes,
+    *,
+    content_type: str = "application/json",
+    digest: str,
+) -> DriveItemInfo:
+    """Create ``ref`` exactly once; a replay of the same bytes is a success.
+
+    ``digest`` is the SHA-256 of ``data`` and is the identity of this write. On a
+    conflict the existing file is read back and hashed: an equal digest means this
+    is a retry of a write that already landed (return the existing item, write
+    nothing), while a different digest raises :class:`IdempotencyCollision`.
+
+    The bytes are compared rather than a stored hash because SharePoint's Graph
+    metadata exposes ``quickXorHash``, not SHA-256 — trusting a different
+    algorithm's value here would be comparing two things that were never equal.
+    Records on this path are small and bounded, so reading one back is cheap.
+    """
+    if not data:
+        raise ValueError("create_file_once: refusing to create an empty file")
+    actual = hashlib.sha256(data).hexdigest()
+    if digest != actual:
+        raise ValueError(
+            f"create_file_once: digest {digest!r} does not match the payload ({actual!r})"
+        )
+    _require_allowed(ref.target)
+    token = _graph_token()
+    drive_id = _resolve_drive_id(ref.target, token)
+    chain = (*_base_segments(ref.target), *ref.segments)
+    url = _path_url(drive_id, chain, suffix="/content") + "?@microsoft.graph.conflictBehavior=fail"
+
+    resp = _call_with_contention_retry(
+        f"create of {ref.path}",
+        lambda: _graph_call(url, token=token, method="PUT", data=data, content_type=content_type),
+    )
+    if resp.status == 409:
+        existing = read_file(ref, max_bytes=max(len(data) * 2, 4096))
+        if hashlib.sha256(existing).hexdigest() == digest:
+            return get_file_metadata(ref)
+        raise IdempotencyCollision(
+            f"{ref.path} already exists with different content; refusing to overwrite a "
+            "client-readable record"
+        )
+    if resp.status >= 400:
+        raise GraphRequestError(f"create of {ref.path} → HTTP {resp.status}", status_code=resp.status)
+    return _item_info(resp.json)
