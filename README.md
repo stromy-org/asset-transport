@@ -82,6 +82,60 @@ This library stays client-agnostic: it accepts a resolved destination and never
 learns which client it belongs to. Mapping a client to its space is the caller's
 job (in Stromy, `companies/<slug>/workspace.json` at the plugin layer).
 
+### Workspace storage (read / list / create-only)
+
+The delivery ladder is write-only. A durable, client-readable project record
+needs three more shapes, added in 0.3.0 and gated by the same allowlist:
+
+```python
+from stromy_asset_transport import (
+    SharePointFileRef, SharePointTarget,
+    ensure_folder, create_file_once, get_file_metadata, read_file, list_children,
+)
+
+target = SharePointTarget(site_id="stromy.sharepoint.com:/sites/ai4comms-collab", base_path="")
+ensure_folder(target, ["KVGO", "Social Media Campaign", "workspace-events"])
+
+ref = SharePointFileRef.of(target, "KVGO", "Social Media Campaign",
+                           "workspace-events", "sha256-abc123.json")
+create_file_once(ref, body, digest=hashlib.sha256(body).hexdigest())  # replay-safe
+
+items, cursor = list_children(target, ["KVGO", "Social Media Campaign", "workspace-events"],
+                              limit=50)
+```
+
+Contract:
+
+- **Create-only, never replace.** `create_file_once` writes with
+  `conflictBehavior: fail`. On a conflict it reads the existing bytes back and
+  compares the SHA-256: an equal digest is a *replay* and succeeds without a
+  second write; a different digest raises `IdempotencyCollision` rather than
+  overwriting a record a client can read. (Bytes are compared rather than a
+  stored hash because SharePoint's Graph metadata exposes `quickXorHash`, not
+  SHA-256.)
+- **No conditional content replacement.** There is deliberately no `update_file`
+  and no `If-Match` on content — Graph's supported small-file upload endpoint
+  documents create-or-replace and no conditional content header, so a
+  read-modify-write retry loop would rest on an undocumented guarantee.
+- **Folders are ensured, never renamed.** `ensure_folder` creates each missing
+  level with `conflictBehavior: fail` and re-resolves on a 409 race. It never
+  lets Graph mint `02 Working 1`, which would silently misfile an artifact.
+- **Reads never export a capability.** `read_file` fetches metadata first and
+  then the short-lived `@microsoft.graph.downloadUrl` **without** an
+  Authorization header; that URL is never returned to a caller or logged.
+- **Every path segment is validated.** `SharePointFileRef.of` and the folder /
+  listing helpers reject `..`, embedded separators, absolute paths, control
+  characters, and leading/trailing dots or spaces — refused before a URL is
+  built, so no caller can escape its allowlisted target.
+- **Listings are bounded.** `list_children` caps at `LIST_CHILDREN_MAX_LIMIT` and
+  returns an opaque cursor; a cursor that does not point at `graph.microsoft.com`
+  is refused.
+- **Contention defers honestly.** A `423`/`429` uses the server's `Retry-After`
+  or the same bounded 2/5/15s schedule the write path uses (four attempts max),
+  then raises `SharePointLockedError` (which `deliver_artifact` already reports
+  as `failure_code="sharepoint_locked"`) for a lock, or `GraphRequestError` for a
+  pure throttle. Nothing is written after a defer.
+
 ## Tests
 
 ```bash
