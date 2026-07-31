@@ -51,7 +51,20 @@ class FakeDrive:
         self.calls: list[tuple[str, str]] = []  # (method, decoded-url)
         self.locked_paths: set[str] = set()
         self.lock_attempts: dict[str, int] = {}
+        # path -> raw Graph version payloads, seeded per test
+        self.versions: dict[str, list[dict[str, object]]] = {}
         self._next_id = 0
+
+    def add_version(
+        self, path: str, *, vid: str, when: str, author: str | None, email: str | None = None
+    ) -> None:
+        entry: dict[str, object] = {"id": vid, "lastModifiedDateTime": when, "size": 10}
+        if author is not None:
+            user: dict[str, object] = {"displayName": author}
+            if email is not None:
+                user["email"] = email
+            entry["lastModifiedBy"] = {"user": user}
+        self.versions.setdefault(path, []).append(entry)
 
     # -- seeding helpers -------------------------------------------------
     def add_folder(self, path: str) -> str:
@@ -127,6 +140,8 @@ class FakeDrive:
             return self._create_child(path, data) if method == "POST" else self._children(path, query)
         if addressed.endswith(":/content"):
             return self._put_content(addressed[: -len(":/content")], data, query)
+        if addressed.endswith(":/versions"):
+            return self._versions(addressed[: -len(":/versions")], query)
         return self._metadata(addressed)
 
     # -- handlers ---------------------------------------------------------
@@ -154,6 +169,20 @@ class FakeDrive:
             return O.GraphResponse(status=404, headers={}, body=b'{"error":{"code":"itemNotFound"}}')
         return O.GraphResponse(
             status=200, headers={}, body=json.dumps(self._payload(path)).encode()
+        )
+
+    def _versions(self, path: str, query: str = "") -> O.GraphResponse:
+        """Serve a seeded version history, honouring `$top`.
+
+        Deliberately returned OUT of chronological order so the tests prove the
+        library sorts rather than trusting Graph's ordering.
+        """
+        if path not in self.items:
+            return O.GraphResponse(status=404, headers={}, body=b'{"error":{"code":"itemNotFound"}}')
+        top = int(urllib_parse.parse_qs(query).get("$top", ["50"])[0])
+        entries = self.versions.get(path, [])
+        return O.GraphResponse(
+            status=200, headers={}, body=json.dumps({"value": entries[:top]}).encode()
         )
 
     def _children(self, path: str, query: str = "") -> O.GraphResponse:
@@ -487,3 +516,64 @@ def test_base_path_is_prefixed_to_every_addressed_path(drive: FakeDrive) -> None
         O.SharePointFileRef.of(_target(base_path="Client Deliverables"), "Proj", "e1.json")
     )
     assert info.name == "e1.json"
+
+
+# ── version timeline (co-edit reconciliation) ────────────────────────────────
+
+
+def test_versions_come_back_newest_first_regardless_of_graph_order(drive: FakeDrive) -> None:
+    drive.add_file("Proj/deck.pptx", b"x")
+    drive.add_version("Proj/deck.pptx", vid="2.0", when="2026-07-28T10:00:00Z", author="A")
+    drive.add_version("Proj/deck.pptx", vid="4.0", when="2026-07-30T10:00:00Z", author="C")
+    drive.add_version("Proj/deck.pptx", vid="3.0", when="2026-07-29T10:00:00Z", author="B")
+    versions = O.list_file_versions(O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"))
+    assert [v.id for v in versions] == ["4.0", "3.0", "2.0"]
+    assert [v.author for v in versions] == ["C", "B", "A"]
+
+
+def test_version_author_carries_a_name_but_never_an_address(drive: FakeDrive) -> None:
+    """A display name answers 'someone else edited this'; an email is a contact
+    detail the co-edit decision never needs, so it must not cross the boundary."""
+    drive.add_file("Proj/deck.pptx", b"x")
+    drive.add_version(
+        "Proj/deck.pptx",
+        vid="2.0",
+        when="2026-07-28T10:00:00Z",
+        author="A Collaborator",
+        email="collab@client.example",
+    )
+    (version,) = O.list_file_versions(O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"))
+    assert version.author == "A Collaborator"
+    assert "collab@client.example" not in json.dumps(version.__dict__)
+
+
+def test_a_version_with_no_author_is_not_an_error(drive: FakeDrive) -> None:
+    drive.add_file("Proj/deck.pptx", b"x")
+    drive.add_version("Proj/deck.pptx", vid="1.0", when="2026-07-28T10:00:00Z", author=None)
+    (version,) = O.list_file_versions(O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"))
+    assert version.author is None
+    assert version.id == "1.0"
+
+
+def test_version_listing_is_capped_and_asks_graph_for_the_cap(drive: FakeDrive) -> None:
+    drive.add_file("Proj/deck.pptx", b"x")
+    for n in range(O.LIST_VERSIONS_MAX_LIMIT + 10):
+        drive.add_version("Proj/deck.pptx", vid=f"{n}.0", when=f"2026-07-30T10:{n:02d}:00Z", author="A")
+    versions = O.list_file_versions(
+        O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"), limit=999
+    )
+    assert len(versions) == O.LIST_VERSIONS_MAX_LIMIT
+    assert f"$top={O.LIST_VERSIONS_MAX_LIMIT}" in drive.calls[-1][1]
+
+
+def test_versions_of_a_missing_file_raise_file_not_found(drive: FakeDrive) -> None:
+    with pytest.raises(O.FileNotFound):
+        O.list_file_versions(O.SharePointFileRef.of(_target(), "Proj", "nope.pptx"))
+
+
+def test_versions_never_reach_graph_for_an_off_allowlist_target(drive: FakeDrive) -> None:
+    with pytest.raises(O.TargetNotAllowed):
+        O.list_file_versions(
+            O.SharePointFileRef.of(_target(site_id=OFF_ALLOWLIST), "Proj", "deck.pptx")
+        )
+    assert drive.calls == []

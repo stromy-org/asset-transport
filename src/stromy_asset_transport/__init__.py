@@ -22,9 +22,11 @@ from __future__ import annotations
 from .delivery import (
     DEFAULT_READ_MAX_BYTES,
     LIST_CHILDREN_MAX_LIMIT,
+    LIST_VERSIONS_MAX_LIMIT,
     DeliveryResult,
     DriveItemInfo,
     FileNotFound,
+    FileVersionInfo,
     GraphRequestError,
     IdempotencyCollision,
     OutputStoreError,
@@ -41,6 +43,7 @@ from .delivery import (
     ensure_folder,
     get_file_metadata,
     list_children,
+    list_file_versions,
     push_to_url,
     read_file,
 )
@@ -48,17 +51,19 @@ from .exceptions import DependencyError, StromyAssetTransportError
 from .keys import tenant_key
 from .store import AssetStore, AssetStoreError
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "DEFAULT_READ_MAX_BYTES",
     "LIST_CHILDREN_MAX_LIMIT",
+    "LIST_VERSIONS_MAX_LIMIT",
     "AssetStore",
     "AssetStoreError",
     "DeliveryResult",
     "DependencyError",
     "DriveItemInfo",
     "FileNotFound",
+    "FileVersionInfo",
     "GraphRequestError",
     "IdempotencyCollision",
     "OutputStoreError",
@@ -76,6 +81,7 @@ __all__ = [
     "ensure_folder",
     "get_file_metadata",
     "list_children",
+    "list_file_versions",
     "push_to_url",
     "read_file",
     "tenant_key",

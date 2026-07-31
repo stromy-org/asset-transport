@@ -228,6 +228,14 @@ class DeliveryResult:
     failure_code: str | None = None
     retryable: bool = False
     attempts: int | None = None
+    #: What this delivery overwrote at the destination, read immediately before
+    #: the PUT. `replaced_existing` is True/False when known and None when the
+    #: probe could not tell — "we did not look" must stay distinguishable from
+    #: "nothing was there". Observation only: a populated `replaced_etag` records
+    #: that a prior version was discarded, it does not mean anything refused.
+    replaced_existing: bool | None = None
+    replaced_etag: str | None = None
+    replaced_last_modified_at: str | None = None
     warnings: list[str] = field(default_factory=_empty_str_list)
 
 
@@ -338,6 +346,9 @@ def deliver_artifact(
                 destination_url=_as_str(sp.get("drive_item_web_url")),
                 destination_item_id=_as_str(sp.get("item_id")),
                 delivered_via=_as_str(sp.get("delivered_via")),
+                replaced_etag=_as_str(sp.get("replaced_etag")),
+                replaced_last_modified_at=_as_str(sp.get("replaced_last_modified_at")),
+                replaced_existing=_as_bool(sp.get("replaced_existing")),
                 warnings=warnings,
             )
 
@@ -744,6 +755,42 @@ def _safe_segment(name: str) -> str:
     return cleaned or "Deliverables"
 
 
+def _peek_existing(
+    drive_id: str, encoded_path: str, *, token: str, path_for_message: str
+) -> dict[str, object]:
+    """Read what is about to be replaced, so an overwrite is at least RECORDED.
+
+    The content PUT below is create-or-replace with no conditional header (see the
+    workspace-storage note on why ``If-Match`` is not used), so a stale-base
+    publish silently discards whatever a collaborator wrote. This does not stop
+    that — it makes it *countable*: one metadata read naming the version being
+    overwritten, so "how often does a publish land on a file that moved?" becomes
+    a question the data can answer instead of one incidents answer.
+
+    Deliberately OBSERVATION-ONLY. It never refuses, never compares against a
+    caller-declared base, and never raises: a delivery that would have succeeded
+    must still succeed, or this instrumentation becomes an outage. Every failure
+    (including "the file is new") resolves to ``existed: False`` with no etag.
+    """
+    url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}"
+    try:
+        resp = _graph_call(url, token=token)
+    except (OutputStoreError, OSError):
+        return {"existed": None}
+    if resp.status == 404:
+        return {"existed": False}
+    if resp.status >= 400:
+        # An unreadable target is not a delivery failure. `None` (vs False) keeps
+        # "we could not tell" distinct from "there was nothing there" in the data.
+        return {"existed": None}
+    payload = resp.json
+    return {
+        "existed": True,
+        "etag": _as_str(payload.get("eTag")),
+        "last_modified_at": _as_str(payload.get("lastModifiedDateTime")),
+    }
+
+
 def deliver_to_sharepoint(
     raw: bytes,
     *,
@@ -818,6 +865,7 @@ def deliver_to_sharepoint(
 
     ctype = content_type or _mime_for(filename)
     encoded_path = urllib_parse.quote(item_path)
+    replaced = _peek_existing(drive_id, encoded_path, token=token, path_for_message=item_path)
     upload_url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}:/content"
     item = _put_with_lock_retries(upload_url, token=token, data=raw, content_type=ctype)
 
@@ -855,6 +903,9 @@ def deliver_to_sharepoint(
         "web_url": share_url,
         "drive_item_web_url": web_url,
         "item_id": item_id,
+        "replaced_etag": replaced.get("etag"),
+        "replaced_last_modified_at": replaced.get("last_modified_at"),
+        "replaced_existing": replaced.get("existed"),
     }
 
 
@@ -916,6 +967,11 @@ _CONTENTION_STATUSES = frozenset({423, 429, 503})
 DEFAULT_READ_MAX_BYTES = 1024 * 1024
 #: Hard cap on one `list_children` page, independent of what the caller asks for.
 LIST_CHILDREN_MAX_LIMIT = 200
+#: Hard cap on one `list_file_versions` read. A co-edit reconciliation needs the
+#: versions since a known base, not a file's whole life; a document co-edited in a
+#: web editor accrues versions fast (an editor saves one on open), so an unbounded
+#: read is both large and useless.
+LIST_VERSIONS_MAX_LIMIT = 50
 
 _MAX_SEGMENT_LEN = 255
 _SEGMENT_ILLEGAL = set('\\/:*?"<>|')
@@ -998,8 +1054,47 @@ class DriveItemInfo:
     size: int | None = None
 
 
+@dataclass(frozen=True)
+class FileVersionInfo:
+    """One entry in a drive item's version history.
+
+    ``author`` is a display name only, by deliberate omission — see
+    :func:`list_file_versions`. It is transient answer-shaped data, not something
+    to persist: the workspace ledger refuses personal data by contract.
+    """
+
+    id: str
+    last_modified_at: str | None
+    author: str | None
+    size: int | None = None
+
+
 def _as_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
+
+
+def _as_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _version_info(payload: dict[str, object]) -> FileVersionInfo:
+    modified_by = payload.get("lastModifiedBy")
+    user: object = (
+        cast("dict[str, object]", modified_by).get("user")
+        if isinstance(modified_by, dict)
+        else None
+    )
+    author = (
+        _as_str(cast("dict[str, object]", user).get("displayName"))
+        if isinstance(user, dict)
+        else None
+    )
+    return FileVersionInfo(
+        id=_as_str(payload.get("id")) or "",
+        last_modified_at=_as_str(payload.get("lastModifiedDateTime")),
+        author=author,
+        size=_as_int(payload.get("size")),
+    )
 
 
 def _item_info(payload: dict[str, object]) -> DriveItemInfo:
@@ -1228,6 +1323,60 @@ def list_children(
             f"listing returned {len(items)} children over the requested limit of {limit}"
         )
     return items, _as_str(payload.get("@odata.nextLink"))
+
+
+def list_file_versions(
+    ref: SharePointFileRef, *, limit: int = LIST_VERSIONS_MAX_LIMIT
+) -> list[FileVersionInfo]:
+    """Return a file's recent version timeline, newest first.
+
+    This is the read a co-edit reconciliation needs and
+    :func:`get_file_metadata` cannot serve: an eTag answers "did it move?", while
+    reconciling a collaborator's edits needs *which* versions intervened and
+    *who* wrote them.
+
+    ``author`` is a display name and nothing else — Graph also offers the editor's
+    email/UPN on ``lastModifiedBy.user`` and this deliberately drops it. A name is
+    the minimum that lets an agent say "someone else edited this since your base";
+    an address is a contact detail the co-edit decision never needs. Callers must
+    treat ``author`` as transient: it belongs in the answer to "should I
+    overwrite?", never in a persisted or client-readable record (the workspace
+    ledger refuses personal data by contract).
+
+    A version list is NOT proof of a content change: web editors save a version on
+    open, so a newer version can be byte-identical to yours. Compare content
+    before concluding a collaborator edited — see ``size`` as a first hint only.
+
+    Raises :class:`TargetNotAllowed` before any Graph call for an off-allowlist
+    target, and :class:`FileNotFound` when the item does not exist.
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    limit = min(limit, LIST_VERSIONS_MAX_LIMIT)
+    _require_allowed(ref.target)
+    token = _graph_token()
+    drive_id = _resolve_drive_id(ref.target, token)
+    url = _path_url(drive_id, (*_base_segments(ref.target), *ref.segments), suffix="/versions")
+    url = f"{url}?$top={limit}"
+    resp = _call_with_contention_retry(
+        f"version listing of {ref.path}", lambda: _graph_call(url, token=token)
+    )
+    if resp.status == 404:
+        raise FileNotFound(str(ref.path))
+    if resp.status >= 400:
+        raise GraphRequestError(
+            f"version listing of {ref.path} → HTTP {resp.status}", status_code=resp.status
+        )
+    raw_values = resp.json.get("value")
+    values = cast("list[object]", raw_values) if isinstance(raw_values, list) else []
+    versions = [
+        _version_info(cast("dict[str, object]", v)) for v in values if isinstance(v, dict)
+    ]
+    # Graph returns versions newest-first, but that ordering is not contractual and
+    # a reconciliation that walks the list backwards would silently fold the wrong
+    # edits. Sort on the one field that is unambiguous.
+    versions.sort(key=lambda v: v.last_modified_at or "", reverse=True)
+    return versions[:limit]
 
 
 def ensure_folder(target: SharePointTarget, segments: Sequence[str]) -> DriveItemInfo | None:
