@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stromy-asset-transport"
-version = "0.3.0"
+version = "0.4.0"
 description = "Domain-agnostic content-addressed asset store and outbound delivery ladder shared by Stromy MCP servers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -66,5 +66,6 @@ markers = [
     "unit: Fast, isolated unit tests",
     "contract: Public API contract stability tests",
     "integration: End-to-end tests",
+    "real_urlopen: Drives a genuine local HTTP server; keeps the real urllib transport",
     # Add `requires_<dep>` markers as you add optional-dependency-gated tests.
 ]

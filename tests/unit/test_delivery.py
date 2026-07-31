@@ -115,6 +115,7 @@ def _serve(handler_class):
     return server, thread
 
 
+@pytest.mark.real_urlopen
 def test_push_to_url_graph_upload_session_uses_content_range_and_no_auth():
     _PutRecorder.request_data = {}
     _PutRecorder.response_code = 201
@@ -138,6 +139,28 @@ def test_push_to_url_graph_upload_session_uses_content_range_and_no_auth():
 
 
 # ── deliver_to_sharepoint() ──────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _no_preexisting_item_by_default(request, monkeypatch):
+    """Default the pre-PUT overwrite probe to "nothing was there".
+
+    `_peek_existing` issues its own raw `_graph_call`, which the
+    `_graph_request`-level fakes in this module do not intercept. Without a
+    default it would reach the real network. A 404 keeps every delivery test that
+    does not care about the probe offline and free of a phantom overwrite; tests
+    that patch `urlopen` themselves override this.
+
+    Opt out with `@pytest.mark.real_urlopen` when a test drives a genuine local
+    HTTP server and must keep the real transport.
+    """
+    if "real_urlopen" in request.keywords:
+        return
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        lambda _request: (_ for _ in ()).throw(_http_error(404, {"error": {"code": "itemNotFound"}})),
+    )
 
 
 def _fake_graph(calls: list[dict]):
@@ -609,3 +632,133 @@ def test_deliver_artifact_none_when_no_backend_for_large(monkeypatch):
     assert res.mode == "none"
     assert res.inline_b64 is None
     assert any("not delivered" in w for w in res.warnings)
+
+
+# ── overwrite instrumentation (ORG-186 observation layer) ────────────────────
+
+
+def _existing_item_urlopen(payload: dict):
+    """A urlopen stand-in that serves ONE metadata payload for the probe."""
+
+    class _Resp:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def getcode(self):
+            # `_graph_call` reads `getattr(resp, "status", resp.getcode())`, whose
+            # default argument is evaluated eagerly — so this must exist even
+            # though `status` is what ends up being used.
+            return self.status
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    return lambda _request: _Resp()
+
+
+def test_delivery_records_the_version_it_overwrote(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    monkeypatch.setattr(O, "_graph_request", _fake_graph([]))
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        _existing_item_urlopen(
+            {"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}
+        ),
+    )
+
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+
+    assert res is not None
+    assert res["replaced_existing"] is True
+    assert res["replaced_etag"] == '"item-1,7"'
+    assert res["replaced_last_modified_at"] == "2026-07-29T18:00:00Z"
+
+
+def test_a_brand_new_file_records_no_overwrite(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    monkeypatch.setattr(O, "_graph_request", _fake_graph([]))
+    # the autouse fixture already answers 404
+
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+
+    assert res is not None
+    assert res["replaced_existing"] is False
+    assert res["replaced_etag"] is None
+
+
+def test_an_unreadable_probe_never_fails_the_delivery(monkeypatch):
+    """Instrumentation must not be able to break a delivery that would succeed.
+
+    `None` (not False) records "we could not tell", so a probe outage never reads
+    as "there was nothing there" in the data.
+    """
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    monkeypatch.setattr(O, "_graph_request", _fake_graph([]))
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        lambda _request: (_ for _ in ()).throw(O.urllib_error.URLError("network down")),
+    )
+
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+
+    assert res is not None
+    assert res["item_id"] == "item-1", "the delivery still succeeded"
+    assert res["replaced_existing"] is None
+
+
+def test_the_probe_reads_the_same_path_the_put_writes(monkeypatch):
+    """A probe of a different path would report an unrelated file's version."""
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setenv("RENDER_SHAREPOINT_BASE_PATH", "Deliverables")
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+    probed: list[str] = []
+
+    def _capture(request):
+        probed.append(request.full_url)
+        raise _http_error(404, {"error": {"code": "itemNotFound"}})
+
+    monkeypatch.setattr(O.urllib_request, "urlopen", _capture)
+
+    O.deliver_to_sharepoint(b"deck", filename="d.pptx", subfolder="Proj/2026-07")
+
+    put = next(c for c in calls if c["method"] == "PUT")
+    assert probed == [put["url"].removesuffix(":/content")]
+
+
+def test_deliver_artifact_surfaces_the_overwrite_on_the_result(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    monkeypatch.setattr(O, "_graph_request", _fake_graph([]))
+    monkeypatch.setattr(
+        O.urllib_request,
+        "urlopen",
+        _existing_item_urlopen(
+            {"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}
+        ),
+    )
+
+    result = O.deliver_artifact(
+        b"deck-bytes", filename="d.pptx", inline_max=0, prefer_sharepoint=True
+    )
+
+    assert result.mode == "sharepoint"
+    assert result.replaced_existing is True
+    assert result.replaced_etag == '"item-1,7"'
