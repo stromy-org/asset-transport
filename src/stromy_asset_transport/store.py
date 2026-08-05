@@ -375,7 +375,7 @@ def _blob_already_exists(exc: Exception) -> bool:
     return "BlobAlreadyExists" in str(exc) or name in {"ResourceExistsError", "ResourceModifiedError"}
 
 
-def build_azure_service() -> tuple[Any, str | None]:
+def build_azure_service(account: str | None = None) -> tuple[Any, str | None]:
     """Build ``(BlobServiceClient, account_name)`` from env, or ``(None, None)``.
 
     Module-public because the sibling ``publication`` primitive shares the exact
@@ -385,8 +385,16 @@ def build_azure_service() -> tuple[Any, str | None]:
     Shared backend-selection contract: account+managed-identity first, then
     connection string. Azure SDKs are imported lazily so non-Azure paths pay
     nothing and the ``azure`` extra stays optional.
+
+    ``account`` overrides ``ASSET_STORE_ACCOUNT`` for callers that own a
+    *different* storage account and must not be steered by this library's env
+    names. A hosted workflow runner is the motivating case: its outputs live on
+    the workflow data-plane account, while ``ASSET_STORE_ACCOUNT`` names the
+    content-addressed brand-asset account. Reading the env var there would send
+    published run artifacts to the wrong account — or, worse, silently succeed
+    today and break whenever the same process also reads a brand asset.
     """
-    account = os.environ.get("ASSET_STORE_ACCOUNT")
+    account = account or os.environ.get("ASSET_STORE_ACCOUNT")
     conn = os.environ.get("ASSET_STORE_CONNECTION_STRING")
     if not account and not conn:
         return None, None
