@@ -150,7 +150,7 @@ class AssetStore:
             dest = staging / blob_key
             return {"upload_url": dest.as_uri(), "blob_key": blob_key, "expires_at": expires_at}
 
-        svc, account_name = _build_azure_service()
+        svc, account_name = build_azure_service()
         if svc is None:
             raise AssetStoreError(
                 "no asset-store backend configured for an upload session. Set "
@@ -375,8 +375,12 @@ def _blob_already_exists(exc: Exception) -> bool:
     return "BlobAlreadyExists" in str(exc) or name in {"ResourceExistsError", "ResourceModifiedError"}
 
 
-def _build_azure_service() -> tuple[Any, str | None]:
+def build_azure_service() -> tuple[Any, str | None]:
     """Build ``(BlobServiceClient, account_name)`` from env, or ``(None, None)``.
+
+    Module-public because the sibling ``publication`` primitive shares the exact
+    same backend-selection contract; duplicating the env precedence there would
+    be two places to change when a backend is added.
 
     Shared backend-selection contract: account+managed-identity first, then
     connection string. Azure SDKs are imported lazily so non-Azure paths pay
@@ -414,7 +418,7 @@ def _build_azure_container(*, read_only: bool) -> Any:
 
     The write path (``read_only=False``) ensures the container exists.
     """
-    svc, _ = _build_azure_service()
+    svc, _ = build_azure_service()
     if svc is None:
         return None
     container_name = os.environ.get("ASSET_STORE_CONTAINER", DEFAULT_CONTAINER)

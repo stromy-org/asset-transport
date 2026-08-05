@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import DependencyError
-from .store import AssetStoreError, _build_azure_service
+from .store import AssetStoreError, build_azure_service
 
 DEFAULT_OUTPUT_CONTAINER = "workflow-outputs"
 
@@ -117,7 +117,7 @@ def artifact_blob_key(*, run_id: str, logical_name: str, filename: str) -> str:
 
 
 def _container_client(*, ensure: bool) -> tuple[Any, str]:
-    svc, _account = _build_azure_service()
+    svc, _account = build_azure_service()
     if svc is None:
         raise AssetStoreError(
             "no storage backend configured for artifact publication. Set "
@@ -200,10 +200,11 @@ def _already_published(blob: Any, digest: str) -> bool:
     is trying to avoid.
     """
     try:
-        props = blob.get_blob_properties()
+        props: Any = blob.get_blob_properties()
     except Exception:  # noqa: BLE001 - not found is the ordinary first-publish case
         return False
-    return bool((props.metadata or {}).get("sha256") == digest)
+    metadata: dict[str, str] = dict(getattr(props, "metadata", None) or {})
+    return metadata.get("sha256") == digest
 
 
 def mint_download_url(
@@ -217,7 +218,7 @@ def mint_download_url(
     Called per authorized read, never stored. Read permission only — a download
     capability must not also be a write or delete capability.
     """
-    svc, account_name = _build_azure_service()
+    svc, account_name = build_azure_service()
     if svc is None or account_name is None:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
         if local_dir:
