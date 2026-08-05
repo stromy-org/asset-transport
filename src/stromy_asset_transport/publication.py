@@ -93,7 +93,16 @@ def _safe_segment(value: str, *, what: str) -> str:
     return cleaned
 
 
-def output_container() -> str:
+def output_container(container: str | None = None) -> str:
+    """Resolve the output container: explicit argument, then env, then default.
+
+    Explicit-first because the two consumers name this account with their own
+    server-owned env vars (the runner's ``STROMY_WORKFLOW_*``, the facade's
+    ``WORKFLOW_*``). Neither should have to also export this library's names to
+    make publication work — that duplication is how the two drift apart.
+    """
+    if container and container.strip():
+        return container.strip()
     return os.environ.get("WORKFLOW_OUTPUT_CONTAINER", DEFAULT_OUTPUT_CONTAINER).strip()
 
 
@@ -116,21 +125,24 @@ def artifact_blob_key(*, run_id: str, logical_name: str, filename: str) -> str:
     )
 
 
-def _container_client(*, ensure: bool) -> tuple[Any, str]:
-    svc, _account = build_azure_service()
+def _container_client(
+    *, ensure: bool, account: str | None = None, container: str | None = None
+) -> tuple[Any, str]:
+    svc, _account = build_azure_service(account)
     if svc is None:
         raise AssetStoreError(
-            "no storage backend configured for artifact publication. Set "
-            "ASSET_STORE_ACCOUNT (managed identity) or ASSET_STORE_CONNECTION_STRING."
+            "no storage backend configured for artifact publication. Pass "
+            "account=, or set ASSET_STORE_ACCOUNT (managed identity) or "
+            "ASSET_STORE_CONNECTION_STRING."
         )
-    name = output_container()
-    container = svc.get_container_client(name)
+    name = output_container(container)
+    client = svc.get_container_client(name)
     if ensure:
         try:
-            container.create_container()
+            client.create_container()
         except Exception:  # noqa: BLE001, S110 - already exists is the common case
             pass
-    return container, name
+    return client, name
 
 
 def publish_artifact(
@@ -140,11 +152,16 @@ def publish_artifact(
     filename: str,
     media_type: str,
     raw: bytes,
+    account: str | None = None,
+    container: str | None = None,
 ) -> PublishedArtifact:
     """Publish one artifact and return its stable descriptor (never a URL).
 
     Idempotent: if the target object already holds these exact bytes, the upload
     is skipped and the same descriptor is returned.
+
+    ``account``/``container`` let a caller name its own storage explicitly rather
+    than inherit this library's env names — see ``build_azure_service``.
     """
     if not raw:
         raise AssetStoreError(
@@ -156,15 +173,19 @@ def publish_artifact(
         run_id=run_id, logical_name=logical_name, filename=filename
     )
 
+    resolved_container = output_container(container)
+
     local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
     if local_dir:
-        dest = Path(local_dir) / output_container() / blob_key
+        dest = Path(local_dir) / resolved_container / blob_key
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not (dest.is_file() and hashlib.sha256(dest.read_bytes()).hexdigest() == digest):
             dest.write_bytes(raw)
     else:
-        container, _name = _container_client(ensure=True)
-        blob = container.get_blob_client(blob_key)
+        client, _name = _container_client(
+            ensure=True, account=account, container=resolved_container
+        )
+        blob = client.get_blob_client(blob_key)
         if not _already_published(blob, digest):
             try:
                 from azure.storage.blob import ContentSettings  # noqa: PLC0415
@@ -187,7 +208,7 @@ def publish_artifact(
         media_type=media_type,
         size_bytes=len(raw),
         sha256=digest,
-        container=output_container(),
+        container=resolved_container,
         blob_key=blob_key,
     )
 
@@ -210,6 +231,7 @@ def _already_published(blob: Any, digest: str) -> bool:
 def mint_download_url(
     *,
     blob_key: str,
+    account: str | None = None,
     container: str | None = None,
     ttl_seconds: int = DEFAULT_DOWNLOAD_TTL_SECONDS,
 ) -> str:
@@ -217,12 +239,15 @@ def mint_download_url(
 
     Called per authorized read, never stored. Read permission only — a download
     capability must not also be a write or delete capability.
+
+    ``account``/``container`` name the storage explicitly — see
+    ``build_azure_service``.
     """
-    svc, account_name = build_azure_service()
+    svc, account_name = build_azure_service(account)
     if svc is None or account_name is None:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
         if local_dir:
-            return (Path(local_dir) / (container or output_container()) / blob_key).as_uri()
+            return (Path(local_dir) / output_container(container) / blob_key).as_uri()
         raise AssetStoreError("no storage backend configured to mint a download URL")
 
     try:
@@ -230,7 +255,7 @@ def mint_download_url(
     except ModuleNotFoundError as exc:
         raise DependencyError("azure", "azure-storage-blob") from exc
 
-    container_name = container or output_container()
+    container_name = output_container(container)
     blob = svc.get_container_client(container_name).get_blob_client(blob_key)
     start = datetime.now(UTC) - timedelta(minutes=5)
     expiry = datetime.now(UTC) + timedelta(seconds=ttl_seconds)

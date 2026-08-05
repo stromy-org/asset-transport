@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from stromy_asset_transport import publication
 from stromy_asset_transport.publication import (
     PublishedArtifact,
     artifact_blob_key,
@@ -185,6 +187,48 @@ def test_two_runs_never_collide_on_one_object() -> None:
 
 
 # --- URL minting -------------------------------------------------------------
+
+
+def test_an_explicit_container_beats_this_librarys_env_var(_local_backend: Path) -> None:
+    """A consumer names its own storage; it must not have to export our env names.
+
+    The runner's outputs live on the workflow data-plane account while
+    ASSET_STORE_ACCOUNT names the brand-asset account. Inheriting the env var
+    there would publish to the wrong account.
+    """
+    published = publish_artifact(
+        run_id=RUN,
+        logical_name="report_pdf",
+        filename="report.pdf",
+        media_type="application/pdf",
+        raw=b"%PDF-1.7",
+        container="somewhere-else",
+    )
+    assert published.container == "somewhere-else"
+    assert (_local_backend / "somewhere-else" / published.blob_key).is_file()
+    # And the descriptor is self-consistent: reminting reads back the same place.
+    assert "somewhere-else" in mint_download_url(
+        blob_key=published.blob_key, container=published.container
+    )
+
+
+def test_an_explicit_account_overrides_the_env_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The override reaches backend selection, not just the container name."""
+    monkeypatch.delenv("ASSET_STORE_LOCAL_DIR", raising=False)
+    monkeypatch.setenv("ASSET_STORE_ACCOUNT", "brandassets")
+
+    seen: dict[str, Any] = {}
+
+    def _fake_service(account: str | None = None) -> tuple[Any, str | None]:
+        seen["account"] = account
+        return None, None
+
+    monkeypatch.setattr(publication, "build_azure_service", _fake_service)
+    with pytest.raises(AssetStoreError):
+        mint_download_url(blob_key=f"{RUN}/report_pdf/report.pdf", account="ststromyworkflows")
+    assert seen["account"] == "ststromyworkflows"
 
 
 def test_a_download_url_is_minted_per_read_not_stored(_local_backend: Path) -> None:
