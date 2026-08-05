@@ -7,6 +7,11 @@ durable record beside them:
   ``fetch(sha256) -> bytes`` (handles in, not inline base64).
 - :func:`deliver_artifact` — outbound delivery ladder returning a
   :class:`DeliveryResult` (URLs/handles out, not raw blobs).
+- :func:`publish_artifact` / :func:`mint_download_url` — run-scoped publication
+  for hosted workflow runs. Deliberately separate from ``deliver_artifact``:
+  publication returns a URL-free :class:`PublishedArtifact` descriptor that is
+  safe to persist, and a fresh short-lived URL is minted per authorized read, so
+  a completed run never becomes unfetchable when a stored SAS expires.
 - the workspace-storage primitives (:func:`ensure_folder`, :func:`create_file_once`,
   :func:`get_file_metadata`, :func:`read_file`, :func:`list_children`) — safe
   read / list / create-only Drive operations for an immutable, client-readable
@@ -49,6 +54,12 @@ from .delivery import (
 )
 from .exceptions import DependencyError, StromyAssetTransportError
 from .keys import tenant_key
+from .publication import (
+    PublishedArtifact,
+    artifact_blob_key,
+    mint_download_url,
+    publish_artifact,
+)
 from .store import AssetStore, AssetStoreError
 
 __version__ = "0.4.0"
@@ -77,6 +88,10 @@ __all__ = [
     "create_file_once",
     "deliver",
     "deliver_artifact",
+    "PublishedArtifact",
+    "artifact_blob_key",
+    "mint_download_url",
+    "publish_artifact",
     "deliver_to_sharepoint",
     "ensure_folder",
     "get_file_metadata",
