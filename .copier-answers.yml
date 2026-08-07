@@ -1,6 +1,7 @@
 # Copier answers — DO NOT EDIT BY HAND.
 # Run `uvx copier update --skip-answered` to pull template improvements.
-_src_path: stromy-org/scaffolds/python-library-template
+_commit: v0.1.0
+_src_path: gh:stromy-org/python-library-template
 author_email: william.masquelier@stromy.com.au
 author_name: William Masquelier
 consumer_repos_to_notify: stromy-format-mcp,media-gen-mcp,asset-broker-mcp
