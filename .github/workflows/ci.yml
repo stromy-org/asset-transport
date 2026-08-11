@@ -1,3 +1,25 @@
+# Self-contained on purpose — do NOT convert this back to a call into
+# `stromy-org/stromy-org/.github/workflows/ci-python.yml`.
+#
+# Every other Python satellite calls that shared reusable workflow, and this repo
+# did too until it went public. The control plane that hosts the shared workflow
+# is PRIVATE and this repo is PUBLIC, so the call stops resolving the moment
+# visibility flips: runs fail at 0s with a startup error and no jobs at all.
+#
+# Inlining is the right shape regardless of the mechanics: a public library must
+# be buildable from its own contents by anyone who clones it. Proving a public
+# package correct via a private workflow is a dependency its own consumers cannot
+# satisfy. This repo went public for exactly that reason — so the public facade
+# `stromy-org/stromy-workflows-mcp` can resolve it without private-build
+# credentials — and shipping it with a private-only CI would have re-created the
+# problem one level down.
+#
+# The cost is real and accepted: this file must be kept in step with
+# ci-python.yml by hand. Keep it minimal so that stays cheap — this repo has no
+# private git+URL dependencies and no `readiness.py`, so the App-token minting and
+# control-plane fetching the shared workflow spends two jobs on have nothing to do
+# here anyway.
+
 name: CI
 
 on:
@@ -7,10 +29,31 @@ on:
     branches: [main]
 
 jobs:
-  python-ci:
-    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
-    with:
-      source_package: "src/stromy_asset_transport"
-    # Forward the org stromy-ci App secrets (CI_APP_ID / CI_APP_PRIVATE_KEY)
-    # so the reusable workflow can clone private deps. No-op if absent.
-    secrets: inherit
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv python install 3.12
+      # The `dev` dependency-group installs by default and pulls in the [azure]
+      # extra, so pyright (strict) type-checks the Azure backend rather than
+      # skipping it as an unresolved import.
+      - run: uv sync
+      - name: Lint
+        run: uv run ruff check
+      - name: Type check
+        run: uv run pyright src/stromy_asset_transport
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv python install 3.12
+      - run: uv sync
+      - name: Tests
+        run: uv run pytest
