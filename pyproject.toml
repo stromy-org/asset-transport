@@ -8,7 +8,13 @@ version = "0.6.0"
 description = "Domain-agnostic content-addressed asset store and outbound delivery ladder shared by Stromy MCP servers"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+# Deliberately NO `license` field. This repository is PUBLIC so that the public
+# workflow facade `stromy-org/stromy-workflows-mcp` can install an exact Git tag
+# without private-build credentials — public visibility is NOT an open-source
+# grant. It matches the source-available posture of `workflow-runtime-core` and
+# the facade itself, neither of which carries a licence. The archetype scaffolds
+# `license = "MIT"`; that grant is removed here on purpose and must not be
+# reintroduced without a separate legal decision (ORG-PLAN-155 task A1).
 authors = [{ name = "William Masquelier", email = "william.masquelier@stromy.com.au" }]
 dependencies = [
     # Add your runtime dependencies here.
