@@ -524,7 +524,7 @@ def test_deliver_artifact_threads_subfolder_to_sharepoint(monkeypatch):
     raw = b"x" * 4096
     seen: dict[str, object] = {}
 
-    def _sp(raw, *, filename, subfolder=None, target=None):
+    def _sp(raw, *, filename, subfolder=None, target=None, **kwargs):
         seen["subfolder"] = subfolder
         seen["target"] = target
         return {"delivered_via": "sharepoint-server", "web_url": "https://sp/s", "item_id": "i"}
@@ -541,7 +541,7 @@ def test_deliver_artifact_threads_sharepoint_target(monkeypatch):
     raw = b"x" * 4096
     seen: dict[str, object] = {}
 
-    def _sp(raw, *, filename, subfolder=None, target=None):
+    def _sp(raw, *, filename, subfolder=None, target=None, **kwargs):
         seen["target"] = target
         return {"delivered_via": "sharepoint-server", "web_url": "https://sp/s", "item_id": "i"}
 
@@ -557,7 +557,7 @@ def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
     monkeypatch.setattr(
         O,
         "deliver_to_sharepoint",
-        lambda raw, *, filename, subfolder=None, target=None: {
+        lambda raw, *, filename, subfolder=None, target=None, **kwargs: {
             "delivered_via": "sharepoint-server",
             "web_url": "https://stromy.sharepoint.com/share/zzz",
             "drive_item_web_url": "https://stromy.sharepoint.com/item",
@@ -574,7 +574,9 @@ def test_deliver_artifact_prefers_sharepoint_for_large(monkeypatch):
 
 def test_deliver_artifact_falls_through_to_sas(monkeypatch, tmp_path):
     raw = b"y" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None: None)
+    monkeypatch.setattr(
+        O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None, **kwargs: None
+    )
     monkeypatch.delenv("ASSET_STORE_ACCOUNT", raising=False)
     monkeypatch.delenv("ASSET_STORE_CONNECTION_STRING", raising=False)
     monkeypatch.setenv("RENDER_OUTPUT_LOCAL_DIR", str(tmp_path / "o"))
@@ -625,7 +627,9 @@ def test_deliver_artifact_pushed_no_dual_link_when_disabled(monkeypatch, tmp_pat
 def test_deliver_artifact_none_when_no_backend_for_large(monkeypatch):
     """A large artifact with no URL backend is NOT inlined — mode 'none'."""
     raw = b"q" * 4096
-    monkeypatch.setattr(O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None: None)
+    monkeypatch.setattr(
+        O, "deliver_to_sharepoint", lambda raw, *, filename, subfolder=None, target=None, **kwargs: None
+    )
     for var in ("RENDER_OUTPUT_LOCAL_DIR", "ASSET_STORE_ACCOUNT", "ASSET_STORE_CONNECTION_STRING"):
         monkeypatch.delenv(var, raising=False)
     res = O.deliver_artifact(raw, filename="big.pdf", inline_max=1024)

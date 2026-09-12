@@ -15,7 +15,10 @@ durable record beside them:
 - the workspace-storage primitives (:func:`ensure_folder`, :func:`create_file_once`,
   :func:`get_file_metadata`, :func:`read_file`, :func:`list_children`) — safe
   read / list / create-only Drive operations for an immutable, client-readable
-  project ledger. Create-only by design: no conditional content replacement.
+  project ledger. The ledger is create-only **by design** (immutability makes a
+  retry a no-op), not because Graph lacks a conditional write — it has one, and
+  :func:`deliver_artifact` uses it as the co-edit guard (``base_version`` /
+  ``base_sha256`` / ``force``, refusing with a :class:`StaleBaseConflict`).
 
 The library is domain-agnostic: it knows nothing about pptx/pdf keys, charters,
 or clients. Callers map :class:`DeliveryResult` into their own result shapes and
@@ -25,6 +28,8 @@ enforce any tenant scoping themselves (see :func:`tenant_key`).
 from __future__ import annotations
 
 from .delivery import (
+    CONFLICT_REASONS,
+    DEFAULT_COMPARE_READ_MAX_BYTES,
     DEFAULT_READ_MAX_BYTES,
     LIST_CHILDREN_MAX_LIMIT,
     LIST_VERSIONS_MAX_LIMIT,
@@ -38,6 +43,7 @@ from .delivery import (
     SharePointFileRef,
     SharePointLockedError,
     SharePointTarget,
+    StaleBaseConflict,
     TargetNotAllowed,
     UnsafePath,
     WorkspaceStorageError,
@@ -65,6 +71,8 @@ from .store import AssetStore, AssetStoreError
 __version__ = "0.4.0"
 
 __all__ = [
+    "CONFLICT_REASONS",
+    "DEFAULT_COMPARE_READ_MAX_BYTES",
     "DEFAULT_READ_MAX_BYTES",
     "LIST_CHILDREN_MAX_LIMIT",
     "LIST_VERSIONS_MAX_LIMIT",
@@ -81,6 +89,7 @@ __all__ = [
     "SharePointFileRef",
     "SharePointLockedError",
     "SharePointTarget",
+    "StaleBaseConflict",
     "StromyAssetTransportError",
     "TargetNotAllowed",
     "UnsafePath",

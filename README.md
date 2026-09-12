@@ -113,10 +113,26 @@ Contract:
   overwriting a record a client can read. (Bytes are compared rather than a
   stored hash because SharePoint's Graph metadata exposes `quickXorHash`, not
   SHA-256.)
-- **No conditional content replacement.** There is deliberately no `update_file`
-  and no `If-Match` on content — Graph's supported small-file upload endpoint
-  documents create-or-replace and no conditional content header, so a
-  read-modify-write retry loop would rest on an undocumented guarantee.
+- **The ledger stays create-only.** There is deliberately no `update_file`: an
+  immutable, content-addressed record makes a retry a no-op rather than a race.
+  That is a design choice, not an API limit. An earlier version of this line said
+  the platform offered no way to write conditionally; that was **false** — Graph
+  honours `If-Match` here (see the co-edit guard below) — and it was the premise
+  ORG-186 was mis-designed around for five weeks.
+- **The co-edit guard is a real compare-and-swap.** `deliver_artifact` /
+  `deliver_to_sharepoint` take `base_version` (the eTag you read before building),
+  `base_sha256` and `force`. The content PUT carries `If-Match: <base_version>`;
+  Graph answers `412` when the destination moved. Because SharePoint's web editors
+  save a version on merely *opening* a file, a 412 alone is not evidence of an edit
+  — the handler reads the current bytes and compares the digest: equal means a
+  zero-change save (re-PUT once against the current eTag, `if_match_retried`),
+  different means a collaborator really edited (refuse with a `StaleBaseConflict`
+  naming the intervening versions and authors). No `base_sha256`, or an unreadable
+  remote, **fails closed**. The happy path costs zero extra round-trips: the
+  compare is bought only after a 412. `If-Match` on this endpoint is **measured,
+  not documented** (probed 2026-09-08), so a 2xx that cannot be reconciled with the
+  header having been honoured surfaces `failure_code: "graph_ignored_if_match"`
+  rather than a clean push.
 - **Folders are ensured, never renamed.** `ensure_folder` creates each missing
   level with `conflictBehavior: fail` and re-resolves on a 409 race. It never
   lets Graph mint `02 Working 1`, which would silently misfile an artifact.

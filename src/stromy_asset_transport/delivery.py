@@ -58,6 +58,11 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # Simple Graph PUT to .../content uploads up to 250 MiB; a single PUT is enough
 # for any artifact under that (no upload session needed for the server push).
 _GRAPH_SIMPLE_PUT_LIMIT = 250 * 1024 * 1024
+#: Ceiling on the bytes the co-edit guard will read back to decide "real edit or
+#: zero-change editor save?" after a 412. Sized for a deliverable (decks and
+#: handbook PDFs run to tens of MiB), not for the small ledger files
+#: `DEFAULT_READ_MAX_BYTES` governs. Override with RENDER_COEDIT_COMPARE_MAX_BYTES.
+DEFAULT_COMPARE_READ_MAX_BYTES = 32 * 1024 * 1024
 _SHAREPOINT_LOCK_RETRY_DELAYS = (2.0, 5.0, 15.0)
 _sleep = time.sleep
 _MIME_BY_EXT = {
@@ -75,6 +80,10 @@ _MIME_BY_EXT = {
     ".mov": "video/quicktime",
 }
 _DEFAULT_MIME = "application/octet-stream"
+
+
+def _empty_dict_list() -> list[dict[str, object]]:
+    return []
 
 
 def _empty_str_list() -> list[str]:
@@ -205,6 +214,51 @@ def _mime_for(filename: str) -> str:
     return _MIME_BY_EXT.get(Path(filename).suffix.lower(), _DEFAULT_MIME)
 
 
+#: Why a conditional write refused. `content_changed` is the real co-edit; the
+#: other three are fail-closed outcomes where the guard could not *prove* the
+#: remote is unchanged and refused rather than overwriting on an assumption.
+CONFLICT_REASONS = (
+    "content_changed",  # the remote bytes genuinely differ from the declared base
+    "compare_unavailable",  # no base_sha256 supplied, so an edit is indistinguishable from an editor-open
+    "remote_unreadable",  # the current version could not be read at 412 time
+    "still_conflicting",  # the one retry after a zero-change save 412'd again
+)
+
+
+@dataclass(frozen=True)
+class StaleBaseConflict:
+    """A refused write: the destination moved away from the caller's declared base.
+
+    Carries what a reconciliation actually needs — *which* versions intervened and
+    *who* wrote them — rather than only "it moved". ``author`` is a display name
+    and nothing else (see :func:`list_file_versions`): it is transient answer-shaped
+    data for the overwrite decision, never something to persist into a
+    client-readable record.
+
+    ``differs`` is the measured content verdict and is ``False`` on the fail-closed
+    reasons, where the guard refused *because* it could not measure. Read ``reason``
+    before reading ``differs``.
+    """
+
+    base_version: str | None
+    current_version: str | None
+    differs: bool
+    reason: str
+    detail: str | None = None
+    intervening: list[dict[str, object]] = field(default_factory=_empty_dict_list)
+
+    def as_payload(self) -> dict[str, object]:
+        """The JSON-safe shape a tool result carries to the agent."""
+        return {
+            "base_version": self.base_version,
+            "current_version": self.current_version,
+            "differs": self.differs,
+            "reason": self.reason,
+            "detail": self.detail,
+            "intervening": list(self.intervening),
+        }
+
+
 @dataclass
 class DeliveryResult:
     """How a delivered artifact left the server.
@@ -236,6 +290,21 @@ class DeliveryResult:
     replaced_existing: bool | None = None
     replaced_etag: str | None = None
     replaced_last_modified_at: str | None = None
+    #: The co-edit guard's verdict (ORG-186). `conflict` is set — and `mode` is
+    #: 'conflict' — when the write was REFUSED because the destination moved away
+    #: from the caller's declared base; nothing was written in that case.
+    conflict: StaleBaseConflict | None = None
+    #: True when the caller passed `force=True`, so the write went out
+    #: unconditionally. Recorded because "this overwrote a collaborator on purpose"
+    #: must be a fact in the result, not an inference from its absence.
+    forced: bool = False
+    #: True when no `base_version` was supplied, so this write was unguarded. The
+    #: point is that an unguarded publish is now VISIBLE rather than silent.
+    base_version_absent: bool = False
+    #: True when a 412 turned out to be a zero-change editor save and the guard
+    #: re-PUT once against the current eTag. This is also the signal that answers
+    #: "does a web-editor open bump the eTag?" from live traffic.
+    if_match_retried: bool = False
     warnings: list[str] = field(default_factory=_empty_str_list)
 
 
@@ -252,6 +321,9 @@ def deliver_artifact(
     dual_link: bool = True,
     subfolder: str | None = None,
     sharepoint_target: SharePointTarget | None = None,
+    base_version: str | None = None,
+    base_sha256: str | None = None,
+    force: bool = False,
 ) -> DeliveryResult:
     """Deliver ``raw`` via the best available channel; never raise on a backend miss.
 
@@ -265,6 +337,22 @@ def deliver_artifact(
     When ``dual_link`` and a pushed artifact also has a blob backend, a short-lived
     SAS ``download_url`` is minted alongside the push destination (best-effort), so
     the caller can offer a browser-openable fallback next to the push target.
+
+    **Co-edit guard (ORG-186), SharePoint rung only.** Pass ``base_version`` (the
+    eTag you read before building) and ``base_sha256`` (that version's digest) to
+    turn the SharePoint PUT into a compare-and-swap that refuses to overwrite a
+    collaborator. A refusal comes back as ``mode='conflict'`` with
+    :attr:`DeliveryResult.conflict` populated and **nothing written** — it does not
+    fall through to the SAS rung, because a conflict is a decision for the caller,
+    not a delivery to reroute. ``force=True`` publishes anyway and records
+    ``forced``. All three are keyword-only with behaviour-preserving defaults:
+    an un-updated caller keeps working, unguarded, and now says so via
+    :attr:`DeliveryResult.base_version_absent`.
+
+    Only a caller that can actually reach a co-edited destination needs them. A
+    consumer that never routes to SharePoint (``media-gen-mcp``'s serialization
+    path, which passes no ``sharepoint_target``) has no file to protect and is
+    intentionally left unguarded rather than threaded for symmetry.
     """
     if not raw:
         raise ValueError("deliver_artifact: refusing to deliver empty bytes")
@@ -319,7 +407,15 @@ def deliver_artifact(
     #    reachable from a sandbox that blocks blob egress).
     if prefer_sharepoint:
         try:
-            sp = deliver_to_sharepoint(raw, filename=filename, subfolder=subfolder, target=sharepoint_target)
+            sp = deliver_to_sharepoint(
+                raw,
+                filename=filename,
+                subfolder=subfolder,
+                target=sharepoint_target,
+                base_version=base_version,
+                base_sha256=base_sha256,
+                force=force,
+            )
         except SharePointLockedError as e:
             warnings.append(
                 "SharePoint kept the destination locked after "
@@ -338,6 +434,36 @@ def deliver_artifact(
             warnings.append(f"sharepoint push failed: {e}")
             sp = None
         if sp is not None:
+            conflict = sp.get("conflict")
+            if isinstance(conflict, StaleBaseConflict):
+                # A refusal is terminal, NOT a rung to fall off. Continuing down the
+                # ladder would hand the caller a SAS link and a `mode` that reads like
+                # a delivery, which is the silent-overwrite failure wearing a new hat.
+                warnings.append(
+                    "refused to overwrite the destination: it moved away from the "
+                    f"`base_version` you declared ({conflict.reason}). Nothing was written."
+                )
+                return DeliveryResult(
+                    mode="conflict",
+                    sha256=sha,
+                    size=size,
+                    failure_code="stale_base",
+                    retryable=True,
+                    conflict=conflict,
+                    replaced_etag=_as_str(sp.get("replaced_etag")),
+                    replaced_last_modified_at=_as_str(sp.get("replaced_last_modified_at")),
+                    replaced_existing=_as_bool(sp.get("replaced_existing")),
+                    warnings=warnings,
+                )
+            guard_failure = _as_str(sp.get("guard_failure"))
+            if guard_failure:
+                warnings.append(
+                    "the conditional write returned success but its result cannot be "
+                    "reconciled with the `If-Match` having been honoured — Graph may have "
+                    "stopped supporting it, in which case this publish overwrote blind. "
+                    "Verify the destination before trusting this delivery."
+                )
+            warnings.extend(cast("list[str]", sp.get("notes") or []))
             return DeliveryResult(
                 mode="sharepoint",
                 sha256=sha,
@@ -346,9 +472,13 @@ def deliver_artifact(
                 destination_url=_as_str(sp.get("drive_item_web_url")),
                 destination_item_id=_as_str(sp.get("item_id")),
                 delivered_via=_as_str(sp.get("delivered_via")),
+                failure_code=guard_failure,
                 replaced_etag=_as_str(sp.get("replaced_etag")),
                 replaced_last_modified_at=_as_str(sp.get("replaced_last_modified_at")),
                 replaced_existing=_as_bool(sp.get("replaced_existing")),
+                forced=force,
+                base_version_absent=base_version is None,
+                if_match_retried=bool(sp.get("if_match_retried")),
                 warnings=warnings,
             )
 
@@ -606,10 +736,17 @@ class GraphResponse:
     lock/throttle, and the **bytes** are the file content itself.
 
     Deliberately NOT a generic escape hatch: ``_graph_call`` accepts a fixed set of
-    request shapes and no caller-supplied header dict, so no caller can smuggle an
-    ``If-Match`` (or any other) header through this layer. Conditional *content*
-    replacement is not part of the supported Graph upload contract and is not
-    offered here — the ledger is create-only instead.
+    request shapes and **no caller-supplied header dict**, so no caller can smuggle
+    arbitrary headers through this layer. The one conditional header it does speak
+    is a *named* parameter (``if_match``), added for the co-edit guard (ORG-186).
+
+    That guard rests on measured behaviour, not on documentation: Graph **does**
+    honour ``If-Match`` on ``PUT /drives/{id}/root:/{path}:/content``, returning
+    ``412 notAllowed`` ("ETag does not match current item's value") on a stale eTag
+    and ``200`` on the current one (probed live 2026-09-08, both request forms).
+    Microsoft does not document it, so the guard treats it as revocable: see
+    ``failure_code="graph_ignored_if_match"`` in :func:`deliver_to_sharepoint`,
+    which is the standing detector for the behaviour being withdrawn.
     """
 
     status: int
@@ -643,13 +780,19 @@ def _graph_call(
     method: str = "GET",
     data: bytes | None = None,
     content_type: str | None = None,
+    if_match: str | None = None,
 ) -> GraphResponse:
     """Issue one Graph request and return the full response, status included.
 
     This is the low-level primitive: an HTTP error status is **returned**, not
     raised, because the workspace layer treats several of them as ordinary
     control flow (404 probes for existence, 409 is the create-only conflict,
-    423/429 drive the bounded contention retry). Only a transport failure raises.
+    412 is the co-edit guard's compare-and-swap miss, 423/429 drive the bounded
+    contention retry). Only a transport failure raises.
+
+    ``if_match`` is a **narrow, named** conditional header, never a generic header
+    escape hatch (see :class:`GraphResponse`). Passing it turns a content PUT into
+    a compare-and-swap; omitting it leaves every existing call byte-identical.
 
     :func:`_graph_request` is the raising wrapper the write path uses, so the
     established "any 4xx/5xx is an exception" contract is unchanged there.
@@ -657,6 +800,8 @@ def _graph_call(
     headers = {"Authorization": f"Bearer {token}"}
     if content_type:
         headers["Content-Type"] = content_type
+    if if_match:
+        headers["If-Match"] = if_match
     if data is not None and method in ("POST", "PUT"):
         headers["Content-Length"] = str(len(data))
     req = urllib_request.Request(url, data=data, headers=headers, method=method)  # noqa: S310
@@ -748,6 +893,159 @@ def _put_with_lock_retries(
             _sleep(_SHAREPOINT_LOCK_RETRY_DELAYS[attempts - 1])
 
 
+def _put_conditional_with_lock_retries(
+    url: str,
+    *,
+    token: str,
+    data: bytes,
+    content_type: str,
+    if_match: str | None,
+) -> GraphResponse:
+    """The conditional twin of :func:`_put_with_lock_retries`.
+
+    Returns the raw :class:`GraphResponse` instead of the parsed body, because a
+    **412 is control flow here, not an error** — it is the compare-and-swap miss
+    the co-edit guard exists to handle. Lock contention retries on the same
+    bounded schedule; every other status (412 included) is returned to the caller
+    to interpret. A genuine failure still raises via :func:`_graph_error_for`
+    at the call site, never here.
+
+    Deliberately a separate function rather than a refactor of
+    :func:`_put_with_lock_retries`: that one goes through :func:`_graph_request`,
+    which is the seam every existing test patches. Leaving it untouched keeps the
+    unconditional path byte-identical.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        resp = _graph_call(
+            url, token=token, method="PUT", data=data, content_type=content_type, if_match=if_match
+        )
+        if not _is_locked(resp):
+            return resp
+        if attempts > len(_SHAREPOINT_LOCK_RETRY_DELAYS):
+            raise SharePointLockedError(
+                f"Graph PUT {url} stayed locked after {attempts} attempts",
+                status_code=resp.status,
+                error_code=_graph_error_code(resp.body),
+                attempts=attempts,
+            )
+        _sleep(_SHAREPOINT_LOCK_RETRY_DELAYS[attempts - 1])
+
+
+def _etag_ordinal(etag: str | None) -> tuple[str, int] | None:
+    """Split a SharePoint eTag ``"{GUID},N"`` into its identity and version ordinal.
+
+    Returns ``None`` when the string is not in that shape — the caller must then
+    treat "cannot tell" as exactly that, never as evidence either way. The whole
+    eTag string including the ``,<n>`` suffix is the comparand for ``If-Match``;
+    this split exists only for the *advance* check described in
+    :func:`deliver_to_sharepoint`, never for building a header.
+    """
+    if not etag:
+        return None
+    body = etag.strip().strip('"')
+    identity, _, ordinal = body.rpartition(",")
+    if not identity or not ordinal.isdigit():
+        return None
+    return identity, int(ordinal)
+
+
+def _list_versions_at_path(
+    drive_id: str, encoded_path: str, *, token: str, limit: int = 10
+) -> list[FileVersionInfo]:
+    """Version timeline for a path-addressed item, for the 412 conflict payload.
+
+    The public :func:`list_file_versions` needs a :class:`SharePointFileRef`, and
+    the delivery ladder has only a resolved ``drive_id`` + encoded path (it may be
+    running off the env destination with no :class:`SharePointTarget` at all). So
+    this issues the same ``/versions`` read against the path the PUT targeted and
+    reuses :func:`_version_info` verbatim — the same display-name-only projection,
+    so no email or UPN can reach a conflict payload through this door either.
+
+    Never raises: a conflict that cannot also enumerate the intervening versions
+    is still a conflict, and degrading to an empty timeline is strictly better
+    than converting a refusal into an exception.
+    """
+    url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}:/versions?$top={limit}"
+    try:
+        resp = _graph_call(url, token=token)
+    except (OutputStoreError, OSError):
+        return []
+    if resp.status >= 400:
+        return []
+    raw_values = resp.json.get("value")
+    values = cast("list[object]", raw_values) if isinstance(raw_values, list) else []
+    versions = [_version_info(cast("dict[str, object]", v)) for v in values if isinstance(v, dict)]
+    versions.sort(key=lambda v: v.last_modified_at or "", reverse=True)
+    return versions[:limit]
+
+
+def _read_content_at_path(
+    drive_id: str, encoded_path: str, *, token: str, max_bytes: int
+) -> tuple[bytes | None, str | None, str | None]:
+    """Read a path-addressed item's current bytes + eTag for the 412 compare.
+
+    Returns ``(raw, etag, unavailable_reason)``. Exactly one of ``raw`` and
+    ``unavailable_reason`` is set; ``etag`` is best-effort either way, because the
+    current version is worth naming in a conflict even when the bytes are not
+    readable.
+
+    Mirrors :func:`read_file`'s credential discipline: metadata first, then the
+    preauthenticated ``@microsoft.graph.downloadUrl`` fetched **without** an
+    Authorization header, and that URL is never returned or logged.
+    """
+    url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}"
+    try:
+        resp = _graph_call(url, token=token)
+    except (OutputStoreError, OSError):
+        return None, None, "the current version could not be read (Graph unreachable)"
+    if resp.status >= 400:
+        return None, None, f"the current version could not be read (HTTP {resp.status})"
+    payload = resp.json
+    etag = _as_str(payload.get("eTag"))
+    size = _as_int(payload.get("size"))
+    if size is not None and size > max_bytes:
+        return None, etag, (
+            f"the current version is {size} bytes, over the {max_bytes}-byte compare "
+            "ceiling (raise RENDER_COEDIT_COMPARE_MAX_BYTES to compare files this large)"
+        )
+    download_url = _as_str(payload.get("@microsoft.graph.downloadUrl"))
+    if not download_url:
+        return None, etag, "the current version exposed no download URL"
+    req = urllib_request.Request(download_url, method="GET")  # noqa: S310
+    try:
+        with urllib_request.urlopen(req) as content:  # noqa: S310
+            data = content.read(max_bytes + 1)
+    except (urllib_error.HTTPError, urllib_error.URLError, OSError):
+        # Deliberately does not interpolate the URL — it is a live credential.
+        return None, etag, "the current version's bytes could not be fetched"
+    if len(data) > max_bytes:
+        return None, etag, f"the current version exceeds the {max_bytes}-byte compare ceiling"
+    return data, etag, None
+
+
+def _compare_read_max_bytes() -> int:
+    """Ceiling on the 412-path content read (env-overridable).
+
+    Deliberately far above :data:`DEFAULT_READ_MAX_BYTES` (1 MiB, sized for small
+    ledger files): the thing being compared here is a *deliverable* — a deck, a
+    handbook PDF — and a ceiling below the artifacts in play would turn every real
+    co-edit into ``compare_too_large`` instead of a usable answer. It is still a
+    ceiling: this read only happens on the 412 branch, and an artifact over it
+    fails **closed** (conflict) rather than proceeding blind.
+    """
+    raw = os.environ.get("RENDER_COEDIT_COMPARE_MAX_BYTES")
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return DEFAULT_COMPARE_READ_MAX_BYTES
+        if parsed > 0:
+            return parsed
+    return DEFAULT_COMPARE_READ_MAX_BYTES
+
+
 def _safe_segment(name: str) -> str:
     """Sanitise a caller-supplied folder/name into a SharePoint-safe path segment."""
     cleaned = "".join("-" if c in '"*:<>?/\\|' else c for c in (name or "").strip())
@@ -760,12 +1058,17 @@ def _peek_existing(
 ) -> dict[str, object]:
     """Read what is about to be replaced, so an overwrite is at least RECORDED.
 
-    The content PUT below is create-or-replace with no conditional header (see the
-    workspace-storage note on why ``If-Match`` is not used), so a stale-base
-    publish silently discards whatever a collaborator wrote. This does not stop
-    that — it makes it *countable*: one metadata read naming the version being
-    overwritten, so "how often does a publish land on a file that moved?" becomes
-    a question the data can answer instead of one incidents answer.
+    This is the OBSERVATION half, and it predates the guard. It makes an overwrite
+    *countable*: one metadata read naming the version being replaced, so "how often
+    does a publish land on a file that moved?" became a question the data could
+    answer instead of one incidents answered. It is still the only thing that runs
+    when a caller supplies no ``base_version`` — an unguarded publish is observed,
+    not refused.
+
+    The REFUSAL half is :func:`_conditional_sharepoint_write`, which a caller opts
+    into with ``base_version``. Note the ordering: this probe runs *before* the PUT
+    and the guard's compare runs only *after* a 412, so the guard costs nothing on
+    the happy path.
 
     Deliberately OBSERVATION-ONLY. It never refuses, never compares against a
     caller-declared base, and never raises: a delivery that would have succeeded
@@ -798,6 +1101,9 @@ def deliver_to_sharepoint(
     subfolder: str | None = None,
     content_type: str | None = None,
     target: SharePointTarget | None = None,
+    base_version: str | None = None,
+    base_sha256: str | None = None,
+    force: bool = False,
 ) -> dict[str, object] | None:
     """Push the artifact to a Stromy SharePoint library; return a durable share link.
 
@@ -816,10 +1122,29 @@ def deliver_to_sharepoint(
     while appearing to honour the target — a silent cross-client mis-delivery.
     With ``target=None`` the behavior is byte-identical to the env-only original.
 
+    **The co-edit guard (ORG-186).** With ``base_version`` set the content PUT
+    becomes a compare-and-swap: Graph is sent ``If-Match: <base_version>`` and
+    answers ``412`` if the destination has moved. A 412 is not by itself evidence
+    of an edit — SharePoint's web editors save a version on merely *opening* a
+    file — so the 412 handler reads the current bytes and compares their digest
+    against ``base_sha256``:
+
+    * digest matches → a zero-change editor save. Re-PUT **once** against the
+      current eTag and proceed silently (``if_match_retried``).
+    * digest differs → a collaborator really edited. Refuse, and return a
+      ``conflict`` naming the intervening versions and their authors.
+    * no ``base_sha256``, or the current version is unreadable → refuse
+      (**fail closed**). The guard never proceeds on an assumption.
+
+    Without ``base_version`` the write is byte-identical to the original
+    unconditional one; with ``force=True`` it is unconditional *and says so*.
+
     Returns ``{"delivered_via","web_url","drive_item_web_url","item_id"}`` on
-    success, or ``None`` when no SharePoint backend is configured (caller then
-    continues down the download ladder). Raises ``OutputStoreError`` only when a
-    *configured* backend genuinely fails, or when ``target`` is off-allowlist.
+    success, a ``{"conflict": StaleBaseConflict, ...}`` dict when the guard
+    refused (nothing was written), or ``None`` when no SharePoint backend is
+    configured (caller then continues down the download ladder). Raises
+    ``OutputStoreError`` only when a *configured* backend genuinely fails, or when
+    ``target`` is off-allowlist.
     """
     if target is not None:
         # Gate first: an off-allowlist target must never reach Graph at all.
@@ -867,7 +1192,49 @@ def deliver_to_sharepoint(
     encoded_path = urllib_parse.quote(item_path)
     replaced = _peek_existing(drive_id, encoded_path, token=token, path_for_message=item_path)
     upload_url = f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded_path}:/content"
-    item = _put_with_lock_retries(upload_url, token=token, data=raw, content_type=ctype)
+
+    notes: list[str] = []
+    if_match_retried = False
+    guard_failure: str | None = None
+    if not base_version or force:
+        # Unguarded or deliberately forced: the original unconditional write, going
+        # through the same `_graph_request` seam it always did.
+        item = _put_with_lock_retries(upload_url, token=token, data=raw, content_type=ctype)
+    elif replaced.get("existed") is False:
+        # The base was deleted between the fetch and the publish. `If-Match` against
+        # a vanished item can only 412 forever, and re-creating it loses nothing a
+        # collaborator still has. Proceed, and say that the base is gone.
+        item = _put_with_lock_retries(upload_url, token=token, data=raw, content_type=ctype)
+        notes.append(
+            "the file named by `base_version` no longer exists at this path; the publish "
+            "created it fresh rather than replacing a version"
+        )
+    else:
+        outcome = _conditional_sharepoint_write(
+            upload_url,
+            drive_id=drive_id,
+            encoded_path=encoded_path,
+            token=token,
+            data=raw,
+            content_type=ctype,
+            base_version=base_version,
+            base_sha256=base_sha256,
+        )
+        if outcome.conflict is not None:
+            return {
+                "delivered_via": "sharepoint-server",
+                "conflict": outcome.conflict,
+                "item_id": None,
+                "web_url": None,
+                "drive_item_web_url": None,
+                "replaced_etag": replaced.get("etag"),
+                "replaced_last_modified_at": replaced.get("last_modified_at"),
+                "replaced_existing": replaced.get("existed"),
+            }
+        item = outcome.item
+        if_match_retried = outcome.if_match_retried
+        guard_failure = outcome.guard_failure
+        notes.extend(outcome.notes)
 
     item_id = _as_str(item.get("id"))
     web_url = _as_str(item.get("webUrl"))
@@ -906,7 +1273,214 @@ def deliver_to_sharepoint(
         "replaced_etag": replaced.get("etag"),
         "replaced_last_modified_at": replaced.get("last_modified_at"),
         "replaced_existing": replaced.get("existed"),
+        "if_match_retried": if_match_retried,
+        "guard_failure": guard_failure,
+        "notes": notes,
     }
+
+
+@dataclass(frozen=True)
+class _ConditionalWriteOutcome:
+    """Internal result of one guarded content PUT."""
+
+    item: dict[str, object]
+    conflict: StaleBaseConflict | None = None
+    if_match_retried: bool = False
+    guard_failure: str | None = None
+    notes: list[str] = field(default_factory=_empty_str_list)
+
+
+def _conditional_sharepoint_write(
+    upload_url: str,
+    *,
+    drive_id: str,
+    encoded_path: str,
+    token: str,
+    data: bytes,
+    content_type: str,
+    base_version: str,
+    base_sha256: str | None,
+) -> _ConditionalWriteOutcome:
+    """PUT with ``If-Match``, and decide what a 412 means. See ORG-186.
+
+    Order matters: the PUT goes **first**, so the untouched-remote case — the
+    overwhelming majority — costs the guard **zero** extra round-trips. The read
+    that decides "real edit or editor-open?" is bought only when Graph says the
+    remote moved.
+    """
+    resp = _put_conditional_with_lock_retries(
+        upload_url, token=token, data=data, content_type=content_type, if_match=base_version
+    )
+    if resp.status == 412:
+        return _resolve_stale_base(
+            upload_url,
+            drive_id=drive_id,
+            encoded_path=encoded_path,
+            token=token,
+            data=data,
+            content_type=content_type,
+            base_version=base_version,
+            base_sha256=base_sha256,
+        )
+    if resp.status >= 400:
+        raise _graph_error_for(resp, method="PUT", url=upload_url)
+    item = resp.json
+    return _ConditionalWriteOutcome(
+        item=item, guard_failure=_detect_ignored_if_match(item, base_version=base_version, written=data)
+    )
+
+
+def _detect_ignored_if_match(
+    item: dict[str, object], *, base_version: str, written: bytes
+) -> str | None:
+    """Catch Graph silently withdrawing the undocumented ``If-Match`` support.
+
+    ``If-Match`` on the content endpoint is **measured, not documented** (probe in
+    :class:`GraphResponse`). If Microsoft ever stops honouring it, a stale-base PUT
+    stops returning 412 and starts returning ``200`` — and the transport is back to
+    overwriting blind while reporting a clean push. That regression must be
+    *detected*, not inherited.
+
+    Two free comparands, both read off the response we already have:
+
+    * **the eTag advance.** An honoured ``If-Match`` can only succeed from exactly
+      ``base_version``, so the new eTag must be that same item at ordinal ``n+1``.
+      A different identity, or a jump of anything but one, means the remote was
+      somewhere else when we wrote — i.e. the header was ignored.
+    * **the size.** The item we just wrote must report the size we sent.
+
+    Returns a ``failure_code`` string when the 2xx **cannot** be reconciled with an
+    honoured header, else ``None``. An unparseable eTag yields ``None``: "cannot
+    tell" is not evidence, and a detector that fires on an eTag format change would
+    be worse than none. ``quickXorHash`` would be a third comparand but requires
+    implementing Microsoft's proprietary hash to verify — size plus the ordinal
+    advance are the two that cost nothing.
+    """
+    size = _as_int(item.get("size"))
+    if size is not None and size != len(written):
+        return "graph_ignored_if_match"
+    base = _etag_ordinal(base_version)
+    current = _etag_ordinal(_as_str(item.get("eTag")))
+    if base is None or current is None:
+        return None
+    if current[0] != base[0] or current[1] != base[1] + 1:
+        return "graph_ignored_if_match"
+    return None
+
+
+def _resolve_stale_base(
+    upload_url: str,
+    *,
+    drive_id: str,
+    encoded_path: str,
+    token: str,
+    data: bytes,
+    content_type: str,
+    base_version: str,
+    base_sha256: str | None,
+) -> _ConditionalWriteOutcome:
+    """The 412 handler: is this a real edit, or a zero-change editor save?"""
+    if not base_sha256:
+        # Fail CLOSED. Without the base digest there is no way to tell an edit from
+        # an editor-open, and guessing in the permissive direction is exactly the
+        # silent overwrite this guard exists to stop.
+        return _ConditionalWriteOutcome(
+            item={},
+            conflict=StaleBaseConflict(
+                base_version=base_version,
+                current_version=None,
+                differs=False,
+                reason="compare_unavailable",
+                detail=(
+                    "the destination moved and no `base_sha256` was supplied, so a real edit "
+                    "cannot be distinguished from a zero-change editor save. Re-fetch with "
+                    "`include_content=True` and carry its `sha256` as `base_sha256`."
+                ),
+                intervening=_intervening_payload(drive_id, encoded_path, token=token),
+            ),
+        )
+
+    current_raw, current_etag, unavailable = _read_content_at_path(
+        drive_id, encoded_path, token=token, max_bytes=_compare_read_max_bytes()
+    )
+    if current_raw is None:
+        return _ConditionalWriteOutcome(
+            item={},
+            conflict=StaleBaseConflict(
+                base_version=base_version,
+                current_version=current_etag,
+                differs=False,
+                reason="remote_unreadable",
+                detail=unavailable,
+                intervening=_intervening_payload(drive_id, encoded_path, token=token),
+            ),
+        )
+
+    if hashlib.sha256(current_raw).hexdigest() != base_sha256:
+        return _ConditionalWriteOutcome(
+            item={},
+            conflict=StaleBaseConflict(
+                base_version=base_version,
+                current_version=current_etag,
+                differs=True,
+                reason="content_changed",
+                detail=(
+                    "the destination's bytes differ from the base you built against; "
+                    "reconcile the intervening versions into your source and republish, "
+                    "or pass force/reconciled to overwrite deliberately."
+                ),
+                intervening=_intervening_payload(drive_id, encoded_path, token=token),
+            ),
+        )
+
+    # Byte-identical: the version bump was a zero-change save (a web editor opening
+    # the file). Retry ONCE against the version we just observed. Once, not a loop:
+    # an unbounded retry against a moving target is how a guard becomes an overwrite.
+    retry = _put_conditional_with_lock_retries(
+        upload_url, token=token, data=data, content_type=content_type, if_match=current_etag
+    )
+    if retry.status == 412:
+        return _ConditionalWriteOutcome(
+            item={},
+            conflict=StaleBaseConflict(
+                base_version=base_version,
+                current_version=current_etag,
+                differs=False,
+                reason="still_conflicting",
+                detail=(
+                    "the destination moved again between the content compare and the retry; "
+                    "nothing was written. Re-fetch and republish."
+                ),
+                intervening=_intervening_payload(drive_id, encoded_path, token=token),
+            ),
+        )
+    if retry.status >= 400:
+        raise _graph_error_for(retry, method="PUT", url=upload_url)
+    item = retry.json
+    return _ConditionalWriteOutcome(
+        item=item,
+        if_match_retried=True,
+        guard_failure=_detect_ignored_if_match(
+            item, base_version=current_etag or base_version, written=data
+        ),
+        notes=[
+            "the destination's version had moved but its bytes were unchanged (a "
+            "zero-change editor save); republished against the current version"
+        ],
+    )
+
+
+def _intervening_payload(drive_id: str, encoded_path: str, *, token: str) -> list[dict[str, object]]:
+    """The version timeline a reconciliation needs, JSON-shaped."""
+    return [
+        {
+            "id": v.id,
+            "author": v.author,
+            "last_modified_at": v.last_modified_at,
+            "size": v.size,
+        }
+        for v in _list_versions_at_path(drive_id, encoded_path, token=token)
+    ]
 
 
 # ── workspace storage: safe read / list / create-only Drive primitives ─────────
@@ -918,13 +1492,19 @@ def deliver_to_sharepoint(
 # nothing else.
 #
 # What is deliberately ABSENT:
-#   * no `update_file` and no `If-Match` on content. Graph's supported small-file
-#     upload endpoint documents create-or-REPLACE and no conditional content
-#     header, so a "read-modify-write with a 412 retry" would be built on an
-#     undocumented guarantee — and a lost update there would silently rewrite a
-#     record a client can read. The ledger is immutable + content-addressed
-#     instead, which makes a retry a no-op rather than a race.
-#   * no arbitrary-header escape hatch (see GraphResponse).
+#   * no `update_file`. The LEDGER stays immutable + content-addressed, which makes
+#     a retry a no-op rather than a race — that is a property worth keeping, not a
+#     workaround for a missing primitive.
+#
+#     This block used to say the reason was that Graph offers no conditional
+#     content header. That was FALSE and it was load-bearing: it is the claim
+#     ORG-186 was designed around for five weeks. Graph honours `If-Match` on
+#     `PUT …root:/<path>:/content` (412 on a stale eTag, 200 on the current one —
+#     probed live 2026-09-08, see GraphResponse), and `deliver_to_sharepoint` now
+#     uses it as a real compare-and-swap. The ledger's immutability is a design
+#     choice; it was never a constraint imposed by the API.
+#   * no arbitrary-header escape hatch (see GraphResponse). `If-Match` is threaded
+#     through a single named parameter, never a caller-supplied header dict.
 #   * no client policy. This layer takes a resolved SharePointTarget and validated
 #     path segments; it never learns which client it belongs to, never reads
 #     client-data, and never decides where a workspace lives.
