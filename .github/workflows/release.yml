@@ -37,12 +37,31 @@ jobs:
             exit 1
           fi
 
+  # Inlined for the SAME reason ci.yml is, and missed when ci.yml was inlined on
+  # 2026-08-11: this repo is PUBLIC and the control plane hosting the shared
+  # `ci-python.yml` is PRIVATE, so the call stops resolving the moment visibility
+  # flips — the whole run fails at 0s with a startup error and NO jobs, which is
+  # why it reads as "the release failed" with nothing to read in the logs.
+  #
+  # ci.yml was fixed; this file was not, and nothing caught it because a release
+  # workflow only runs on a tag push. The first tag after the flip (v0.7.0,
+  # 2026-09-12) was the first to hit it. Keep both files in step by hand.
   quality:
     needs: guard
-    uses: stromy-org/stromy-org/.github/workflows/ci-python.yml@main
-    with:
-      source_package: "src/stromy_asset_transport"
-    secrets: inherit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv python install 3.12
+      - run: uv sync
+      - name: Lint
+        run: uv run ruff check
+      - name: Type check
+        run: uv run pyright src/stromy_asset_transport
+      - name: Tests
+        run: uv run pytest
 
   build-and-release:
     needs: [guard, quality]
