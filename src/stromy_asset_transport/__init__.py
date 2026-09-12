@@ -68,7 +68,7 @@ from .publication import (
 )
 from .store import AssetStore, AssetStoreError
 
-__version__ = "0.4.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "CONFLICT_REASONS",
