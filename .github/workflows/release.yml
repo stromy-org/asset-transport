@@ -101,11 +101,27 @@ jobs:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Explicit scope, and NOT optional: with create-github-app-token@v2,
+          # `owner` without `repositories` does not grant the whole installation
+          # (unlike @v1) — verified live 2026-08-07 and already relied on by this
+          # repo's copier-update.yml. Every repo this job dispatches into must be
+          # listed here or the call 404s. It also bounds the minted token to the
+          # three consumers, which matters more here than in a private satellite:
+          # this repo is PUBLIC.
+          repositories: |
+            stromy-format-mcp
+            media-gen-mcp
+            asset-broker-mcp
 
       - name: Notify stromy-format-mcp,media-gen-mcp,asset-broker-mcp to auto-bump the pin
         # Fires a repository_dispatch event into the listed consumer repo(s).
-        # The bump-internal-lib.yml workflow there opens a PR rewriting the
-        # tag in [tool.uv.sources] and regenerating uv.lock.
+        #
+        # NOTE (2026-09-13): none of these three repos currently has a
+        # `repository_dispatch` receiver — `bump-internal-lib.yml` exists only in
+        # `stromy-org/Stromy`. `gh api .../dispatches` returns 204 whether or not
+        # anything listens, so these calls succeed and bump nothing. Consumer pins
+        # are re-pinned by hand until the receivers exist (ORG-296). Kept wired
+        # rather than deleted so adding a receiver is the only remaining step.
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO_SLUG: ${{ github.event.repository.name }}
