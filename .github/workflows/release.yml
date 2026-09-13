@@ -90,51 +90,18 @@ jobs:
             --generate-notes \
             dist/*
 
-      - name: Mint GitHub App token
-        # stromy-ci App token with Contents: write on the consumer repo — lets
-        # this release fire the auto-bump repository_dispatch. Unlike the default
-        # GITHUB_TOKEN, an App token triggers the downstream bump workflow.
-        # See infra-docs/ai/cross-repo-pats.md.
-        uses: actions/create-github-app-token@v2
-        id: app-token
-        with:
-          app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          # Explicit scope, and NOT optional: with create-github-app-token@v2,
-          # `owner` without `repositories` does not grant the whole installation
-          # (unlike @v1) — verified live 2026-08-07 and already relied on by this
-          # repo's copier-update.yml. Every repo this job dispatches into must be
-          # listed here or the call 404s. It also bounds the minted token to the
-          # three consumers, which matters more here than in a private satellite:
-          # this repo is PUBLIC.
-          repositories: |
-            stromy-format-mcp
-            media-gen-mcp
-            asset-broker-mcp
-
-      - name: Notify stromy-format-mcp,media-gen-mcp,asset-broker-mcp to auto-bump the pin
-        # Fires a repository_dispatch event into the listed consumer repo(s).
-        #
-        # NOTE (2026-09-13): none of these three repos currently has a
-        # `repository_dispatch` receiver — `bump-internal-lib.yml` exists only in
-        # `stromy-org/Stromy`. `gh api .../dispatches` returns 204 whether or not
-        # anything listens, so these calls succeed and bump nothing. Consumer pins
-        # are re-pinned by hand until the receivers exist (ORG-296). Kept wired
-        # rather than deleted so adding a receiver is the only remaining step.
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          REPO_SLUG: ${{ github.event.repository.name }}
-        run: |
-          gh api repos/stromy-org/stromy-format-mcp/dispatches \
-            -f event_type=internal-lib-released \
-            -F "client_payload[repo]=${REPO_SLUG}" \
-            -F "client_payload[tag]=${GITHUB_REF_NAME}"
-          gh api repos/stromy-org/media-gen-mcp/dispatches \
-            -f event_type=internal-lib-released \
-            -F "client_payload[repo]=${REPO_SLUG}" \
-            -F "client_payload[tag]=${GITHUB_REF_NAME}"
-          gh api repos/stromy-org/asset-broker-mcp/dispatches \
-            -f event_type=internal-lib-released \
-            -F "client_payload[repo]=${REPO_SLUG}" \
-            -F "client_payload[tag]=${GITHUB_REF_NAME}"
+      # NO auto-bump dispatch here, deliberately (ORG-296, 2026-09-13).
+      #
+      # This step used to fire `repository_dispatch` at a hand-written list of
+      # consumer repos. `POST /dispatches` returns 204 whether or not anything
+      # listens, so the list could rot in silence — and it had: the receiver
+      # existed in one repo, five named targets had none, and eight real
+      # consumers were named by no sender at all.
+      #
+      # Pins are now reconciled centrally by stromy-org's
+      # .github/workflows/internal-lib-pins.yml, which DERIVES the consumer
+      # graph from every repo's own [tool.uv.sources] each run and opens the
+      # bump PRs. Nothing here needs to know who consumes this library.
+      #
+      # Re-adding a fan-out is gated: `internal-lib-pins.py --check` fails on a
+      # dispatch aimed at a repo with no receiver.
