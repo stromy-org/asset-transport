@@ -185,3 +185,149 @@ def test_create_upload_url_no_backend_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(A, "DISK_CACHE_DIR", tmp_path / "cache")
     with pytest.raises(A.AssetStoreError, match="no asset-store backend"):
         A.AssetStore().create_upload_url()
+
+
+# -- exists (pre-flight de-duplication) --------------------------------------------
+
+
+def test_exists_true_for_stored_blob(store):
+    s, _ = store
+    sha = s.put(b"already-here")
+    assert s.exists(sha) is True
+
+
+def test_exists_false_for_absent_blob(store):
+    s, _ = store
+    absent = hashlib.sha256(b"never-stored").hexdigest()
+    assert s.exists(absent) is False
+
+
+def test_exists_never_downloads(store, monkeypatch):
+    """A cache-cold hit must answer from the backend's existence probe, not a fetch."""
+    s, backend = store
+    raw = b"big-blob" * 1000
+    sha = _put_raw(backend, raw)
+    (A.DISK_CACHE_DIR / sha).unlink(missing_ok=True)
+    monkeypatch.setattr(
+        A.AssetStore, "_backend_fetch", lambda *_a, **_k: pytest.fail("exists() downloaded")
+    )
+    assert s.exists(sha) is True
+
+
+def test_exists_invalid_handle_raises(store):
+    s, _ = store
+    with pytest.raises(ValueError, match="not a valid sha256"):
+        s.exists("not-a-digest")
+
+
+def test_exists_raises_on_backend_error(tmp_path, monkeypatch):
+    """A store we cannot reach must NOT read as 'absent'.
+
+    Absent means "ask the client to upload it again"; answering False on a
+    transport failure is how a 13 MB re-upload gets requested for a blob we hold.
+    """
+    monkeypatch.delenv("ASSET_STORE_LOCAL_DIR", raising=False)
+    monkeypatch.setenv("ASSET_STORE_ACCOUNT", "ststromybrandassets")
+    monkeypatch.setattr(A, "DISK_CACHE_DIR", tmp_path / "cache")
+
+    class _Boom:
+        def exists(self) -> bool:
+            raise RuntimeError("transient network failure")
+
+    class _Container:
+        def get_blob_client(self, _key: str) -> _Boom:
+            return _Boom()
+
+    s = A.AssetStore()
+    monkeypatch.setattr(A.AssetStore, "_read_azure_container", lambda _self: _Container())
+    sha = hashlib.sha256(b"whatever").hexdigest()
+    with pytest.raises(A.AssetStoreError, match="Refusing to report it absent"):
+        s.exists(sha)
+
+
+# -- asset class (monotonic; blob index tag / local sidecar) -----------------------
+
+
+def _class_of(backend, sha: str) -> str | None:
+    p = backend / f"{sha}.class"
+    return p.read_text().strip() if p.is_file() else None
+
+
+def test_put_without_class_writes_no_class(store):
+    s, backend = store
+    sha = s.put(b"an-unclassified-render-artifact")
+    assert _class_of(backend, sha) is None
+
+
+def test_put_writes_class(store):
+    s, backend = store
+    sha = s.put(b"a-source-deck-screenshot", asset_class="deliverable")
+    assert _class_of(backend, sha) == "deliverable"
+
+
+def test_class_upgrade(store):
+    """deliverable -> brand upgrades, ON A BLOB THE STORE ALREADY HOLDS.
+
+    put() is PUT-if-absent, so the second call short-circuits the upload. If the
+    tag rode the upload it would never be written, and Use Case 5 — the client's
+    own logo, first seen inside their source deck — would keep `deliverable` and
+    be deleted on day 90.
+    """
+    s, backend = store
+    raw = b"the-clients-own-logo"
+    sha = s.put(raw, asset_class="deliverable")
+    assert _class_of(backend, sha) == "deliverable"
+    assert s.put(raw, asset_class="brand") == sha
+    assert _class_of(backend, sha) == "brand"
+
+
+def test_class_no_downgrade(store):
+    """brand -> deliverable is refused silently, on an existing blob."""
+    s, backend = store
+    raw = b"a-genuine-brand-asset"
+    sha = s.put(raw, asset_class="brand")
+    assert _class_of(backend, sha) == "brand"
+    assert s.put(raw, asset_class="deliverable") == sha
+    assert _class_of(backend, sha) == "brand"
+
+
+def test_class_reclass_is_idempotent(store):
+    s, backend = store
+    raw = b"same-class-twice"
+    sha = s.put(raw, asset_class="brand")
+    s.put(raw, asset_class="brand")
+    assert _class_of(backend, sha) == "brand"
+
+
+def test_class_rejects_unknown(store):
+    s, backend = store
+    with pytest.raises(ValueError, match="unknown asset_class"):
+        s.put(b"some-bytes", asset_class="whatever")
+    # Refused before the write: nothing was stored under a bogus class.
+    assert list(backend.glob("*.class")) == []
+
+
+def test_finalize_upload_writes_class(store):
+    s, backend = store
+    session = s.create_upload_url()
+    _staging_path(str(session["upload_url"])).write_bytes(b"uploaded-source-deck")
+    sha, _size = s.finalize_upload(str(session["blob_key"]), asset_class="deliverable")
+    assert _class_of(backend, sha) == "deliverable"
+
+
+def test_finalize_upload_upgrades_class(store):
+    s, backend = store
+    raw = b"logo-first-seen-in-a-deck"
+    sha = s.put(raw, asset_class="deliverable")
+    session = s.create_upload_url()
+    _staging_path(str(session["upload_url"])).write_bytes(raw)
+    assert s.finalize_upload(str(session["blob_key"]), asset_class="brand")[0] == sha
+    assert _class_of(backend, sha) == "brand"
+
+
+def test_finalize_upload_rejects_unknown_class(store):
+    s, _ = store
+    session = s.create_upload_url()
+    _staging_path(str(session["upload_url"])).write_bytes(b"bytes")
+    with pytest.raises(ValueError, match="unknown asset_class"):
+        s.finalize_upload(str(session["blob_key"]), asset_class="rubbish")

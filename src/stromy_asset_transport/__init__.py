@@ -66,11 +66,12 @@ from .publication import (
     mint_download_url,
     publish_artifact,
 )
-from .store import AssetStore, AssetStoreError
+from .store import ASSET_CLASSES, AssetStore, AssetStoreError
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
+    "ASSET_CLASSES",
     "CONFLICT_REASONS",
     "DEFAULT_COMPARE_READ_MAX_BYTES",
     "DEFAULT_READ_MAX_BYTES",

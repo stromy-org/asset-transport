@@ -23,6 +23,14 @@ from stromy_asset_transport import AssetStore, deliver_artifact, DeliveryResult,
 store = AssetStore()
 sha = store.put(font_bytes)          # -> "sha256…" (PUT-if-absent, content-addressed)
 raw = store.fetch(sha)               # -> bytes (mem → disk → backend, digest-verified)
+if store.exists(sha): ...            # -> bool, never downloads; a backend error RAISES
+                                     #    (a store we cannot reach is not "absent")
+
+# Optional asset class, written as a blob INDEX TAG so a storage lifecycle rule can
+# filter on it. MONOTONIC: deliverable → brand upgrades even on a blob already in the
+# store; brand → deliverable is refused silently. Omit it and the blob stays untagged —
+# and an untagged blob is never expired, by construction.
+store.put(logo_bytes, asset_class="brand")
 
 # Outbound: URLs/handles out, not raw blobs. One ladder, four modes.
 result = deliver_artifact(

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stromy-asset-transport"
-version = "0.7.0"
+version = "0.8.0"
 description = "Domain-agnostic content-addressed asset store and outbound delivery ladder shared by Stromy MCP servers"
 readme = "README.md"
 requires-python = ">=3.11"
