@@ -52,6 +52,23 @@ DISK_CACHE_DIR = Path(os.environ.get("ASSET_STORE_CACHE_DIR", "/tmp/stromy-asset
 _CACHE_MAX_ENTRIES = int(os.environ.get("ASSET_STORE_CACHE_MAX_ENTRIES", "256"))
 _MEM_CACHE_MAX_ENTRIES = int(os.environ.get("ASSET_STORE_MEM_CACHE_MAX_ENTRIES", "64"))
 
+# -- asset class ---------------------------------------------------------------
+# A blob is `brand` (a client's own brand material, kept) or `deliverable` (a
+# client's source material staged for a render, expired after 90 days). The class
+# rides the blob as an Azure **index tag**, not metadata, because only index tags
+# can be filtered on by a storage lifecycle rule (`match_blob_index_tag`) — which
+# is what lets the platform do the expiring instead of a scheduled job of ours.
+# The local-dir backend has no tag concept, so there the class is a `<key>.class`
+# sidecar written under the identical monotonic rule: the whole contract is
+# exercisable in tests with no Azure at all.
+_CLASS_TAG = "asset_class"
+_CLASS_BRAND = "brand"
+_CLASS_DELIVERABLE = "deliverable"
+_CLASS_SIDECAR_SUFFIX = ".class"
+#: The classes the store recognises. `brand` outranks `deliverable`; see
+#: :meth:`AssetStore.put` for the monotonic reconciliation rule.
+ASSET_CLASSES = frozenset({_CLASS_BRAND, _CLASS_DELIVERABLE})
+
 
 class AssetStoreError(RuntimeError):
     """Handle could not be resolved or stored (missing blob, no backend, corruption).
@@ -63,6 +80,16 @@ class AssetStoreError(RuntimeError):
 
 def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def _validate_asset_class(asset_class: str | None) -> None:
+    """Refuse a class the store does not define. The store does not invent classes."""
+    if asset_class is None or asset_class in ASSET_CLASSES:
+        return
+    raise ValueError(
+        f"unknown asset_class {asset_class!r} — expected one of "
+        f"{sorted(ASSET_CLASSES)} (or None for an unclassified blob)"
+    )
 
 
 class AssetStore:
@@ -111,17 +138,61 @@ class AssetStore:
         self._mem_put(key, raw)
         return raw
 
-    def put(self, data: bytes) -> str:
+    def exists(self, sha256: str) -> bool:
+        """True when the content-addressed blob is present. Never downloads.
+
+        A cache hit, or a HEAD against the backend. This is the pre-flight
+        de-duplication primitive: a caller holding a candidate's bytes can ask
+        whether the store already has them *without moving any*, which turns "the
+        client re-uploads a 13 MB deck" into "nothing happens".
+
+        A backend error is NOT swallowed into ``False``. A store we cannot reach
+        must not read as "absent", because absent means "ask the client to upload
+        it again" — and asking for an upload we already hold is the exact cost
+        this method exists to avoid.
+        """
+        key = sha256.lower()
+        if not _is_sha256(key):
+            # ValueError, not AssetStoreError: a malformed argument is the caller's
+            # bug, not a store failure, and it is refused before any network call.
+            raise ValueError(f"not a valid sha256 handle: {sha256!r}")
+
+        if self._mem_get(key) is not None or (DISK_CACHE_DIR / key).is_file():
+            return True
+        return self._backend_exists(key)
+
+    def put(self, data: bytes, *, asset_class: str | None = None) -> str:
         """Store ``data`` keyed by its sha256 (PUT-if-absent); return the handle.
 
         Idempotent: storing the same bytes twice writes once. Populates the local
         caches so an immediate ``fetch`` of the returned handle hits in-process.
         Raises ``AssetStoreError`` on empty input or a missing/failed backend.
+
+        ``asset_class`` (``"brand"`` | ``"deliverable"``) is written as a blob
+        **index tag** so an Azure lifecycle rule can filter on it — metadata
+        cannot be filtered on, tags can. OPTIONAL by design: several live call
+        sites store unclassified render artifacts, and an untagged blob is never
+        expired, by construction.
+
+        CLASS IS MONOTONIC, AND THAT IS WHY THIS IS NOT A ONE-LINER. ``put``
+        short-circuits when the blob already exists, so tagging cannot ride the
+        upload. After the PUT-if-absent step this ALWAYS reconciles the tag:
+
+          * no existing tag      -> write ``asset_class``
+          * existing == new      -> no-op
+          * deliverable -> brand -> UPGRADE (set the tag)
+          * brand -> deliverable -> REFUSE SILENTLY (leave ``brand``)
+
+        Without the upgrade branch, a picture first seen inside a client's source
+        deck and later re-staged as a genuine brand asset keeps ``deliverable``
+        and is deleted by the lifecycle rule on day 90.
         """
         if not data:
             raise AssetStoreError("refusing to store empty bytes (no content-addressable handle)")
+        _validate_asset_class(asset_class)
         key = hashlib.sha256(data).hexdigest()
         self._backend_put(key, data)
+        self._reconcile_class(key, asset_class)
         # Warm the caches so a fetch in the same process resolves without a round-trip.
         self._disk_put(key, data)
         self._mem_put(key, data)
@@ -163,16 +234,28 @@ class AssetStore:
         upload_url = _azure_write_sas(svc, account_name, blob_key, ttl_seconds=ttl_seconds)
         return {"upload_url": upload_url, "blob_key": blob_key, "expires_at": expires_at}
 
-    def finalize_upload(self, blob_key: str, *, expected_sha256: str | None = None) -> tuple[str, int]:
+    def finalize_upload(
+        self,
+        blob_key: str,
+        *,
+        expected_sha256: str | None = None,
+        asset_class: str | None = None,
+    ) -> tuple[str, int]:
         """Move a staged out-of-band upload into the content-addressed store.
 
         Reads the staging blob at ``blob_key``, hashes it → sha256, stores it under
         that key (PUT-if-absent), deletes the staging blob, and returns
         ``(sha256, size)``. Raises ``AssetStoreError`` if the staged blob is missing,
         empty, or (when ``expected_sha256`` is given) does not match the digest.
+
+        ``asset_class`` is reconciled exactly as :meth:`put` reconciles it — same
+        monotonic rule, same helper. The browser-upload path never calls ``put``,
+        so without this keyword every handle minted through an upload link would
+        reach the store untagged and outside the lifecycle rule's reach.
         """
         if expected_sha256 is not None and not _is_sha256(expected_sha256.lower()):
             raise AssetStoreError(f"not a valid sha256 handle: {expected_sha256!r}")
+        _validate_asset_class(asset_class)
         raw = self._staging_read(blob_key)
         if not raw:
             raise AssetStoreError(
@@ -185,6 +268,7 @@ class AssetStore:
                 f"sha256:{expected_sha256.lower()} (corrupt or wrong upload)"
             )
         self._backend_put(key, raw)
+        self._reconcile_class(key, asset_class)
         self._disk_put(key, raw)
         self._mem_put(key, raw)
         self._staging_delete(blob_key)
@@ -353,6 +437,92 @@ class AssetStore:
             if _blob_already_exists(e):
                 return
             raise AssetStoreError(f"failed to store sha256:{key} to blob backend: {e}") from e
+
+    def _backend_exists(self, key: str) -> bool:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            return (Path(local_dir) / key).is_file()
+
+        container = self._read_azure_container()
+        if container is None:
+            raise AssetStoreError(
+                "no asset-store backend configured. Set ASSET_STORE_LOCAL_DIR "
+                "(tests/dev), ASSET_STORE_ACCOUNT (managed identity), or "
+                "ASSET_STORE_CONNECTION_STRING."
+            )
+        try:
+            return bool(container.get_blob_client(key).exists())
+        except Exception as e:  # noqa: BLE001 — a store we cannot reach is NOT "absent"
+            raise AssetStoreError(
+                f"could not determine whether sha256:{key} is present in the blob "
+                f"store: {e}. Refusing to report it absent — absent means 'ask the "
+                f"client to upload it again'."
+            ) from e
+
+    # -- asset class (blob index tags) ----------------------------------------
+
+    def _reconcile_class(self, key: str, asset_class: str | None) -> None:
+        """Apply the monotonic class rule to the blob at ``key``. See :meth:`put`.
+
+        Runs AFTER the PUT-if-absent step, on every call, because ``_backend_put``
+        short-circuits on an existing blob — so a tag written only at upload time
+        would never reclass a blob the store already holds.
+        """
+        if asset_class is None:
+            return
+        existing = self._read_class(key)
+        if existing == asset_class:
+            return
+        if existing == _CLASS_BRAND:
+            # brand -> deliverable is a DOWNGRADE. Refuse silently: a later,
+            # less-informed caller must not be able to schedule a live brand
+            # asset for deletion.
+            return
+        self._write_class(key, asset_class)
+
+    def _read_class(self, key: str) -> str | None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            sidecar = Path(local_dir) / f"{key}{_CLASS_SIDECAR_SUFFIX}"
+            if not sidecar.is_file():
+                return None
+            value = sidecar.read_text(encoding="utf-8").strip()
+            return value or None
+
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for a class read")
+        try:
+            tags: dict[str, Any] = dict(container.get_blob_client(key).get_blob_tags() or {})
+        except Exception as e:  # noqa: BLE001
+            raise AssetStoreError(f"failed to read the class tag of sha256:{key}: {e}") from e
+        value: Any = tags.get(_CLASS_TAG)
+        return str(value) if value else None
+
+    def _write_class(self, key: str, asset_class: str) -> None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            d = Path(local_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".{key}{_CLASS_SIDECAR_SUFFIX}.tmp"
+            tmp.write_text(asset_class, encoding="utf-8")
+            tmp.replace(d / f"{key}{_CLASS_SIDECAR_SUFFIX}")
+            return
+
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for a class write")
+        try:
+            container.get_blob_client(key).set_blob_tags({_CLASS_TAG: asset_class})
+        except Exception as e:  # noqa: BLE001
+            # Deliberately NOT best-effort. A blob stored without its class is an
+            # un-expirable orphan, and silence here is how the tag drifts from the
+            # ledger that believes it was written.
+            raise AssetStoreError(
+                f"stored sha256:{key} but failed to write its {_CLASS_TAG}="
+                f"{asset_class!r} index tag: {e}. The blob is now untagged and "
+                f"outside the lifecycle rule — this must not pass silently."
+            ) from e
 
     def _read_azure_container(self) -> Any:
         if self._read_checked:
