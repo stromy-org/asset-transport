@@ -143,6 +143,7 @@ def _staging_path(upload_url: str):
     from pathlib import Path as _Path
     from urllib.parse import urlparse
     from urllib.request import url2pathname
+
     return _Path(url2pathname(urlparse(upload_url).path))
 
 
@@ -208,9 +209,7 @@ def test_exists_never_downloads(store, monkeypatch):
     raw = b"big-blob" * 1000
     sha = _put_raw(backend, raw)
     (A.DISK_CACHE_DIR / sha).unlink(missing_ok=True)
-    monkeypatch.setattr(
-        A.AssetStore, "_backend_fetch", lambda *_a, **_k: pytest.fail("exists() downloaded")
-    )
+    monkeypatch.setattr(A.AssetStore, "_backend_fetch", lambda *_a, **_k: pytest.fail("exists() downloaded"))
     assert s.exists(sha) is True
 
 

@@ -53,9 +53,7 @@ def test_a_traversal_in_the_logical_name_cannot_leave_the_run_prefix(
 ) -> None:
     """A workflow's declaration is still authored text."""
     try:
-        key = artifact_blob_key(
-            run_id=RUN, logical_name=logical_name, filename="report.pdf"
-        )
+        key = artifact_blob_key(run_id=RUN, logical_name=logical_name, filename="report.pdf")
     except AssetStoreError:
         return  # refused outright, which is also correct
     assert key.startswith(f"{RUN}/")
@@ -63,9 +61,7 @@ def test_a_traversal_in_the_logical_name_cannot_leave_the_run_prefix(
 
 
 def test_a_traversal_in_the_filename_cannot_leave_the_run_prefix() -> None:
-    key = artifact_blob_key(
-        run_id=RUN, logical_name="report_pdf", filename="../../../evil.pdf"
-    )
+    key = artifact_blob_key(run_id=RUN, logical_name="report_pdf", filename="../../../evil.pdf")
     assert key == f"{RUN}/report_pdf/evil.pdf"
 
 
@@ -95,9 +91,7 @@ def test_publishing_returns_a_descriptor_and_never_a_url() -> None:
     assert published.container == "workflow-outputs"
     assert published.blob_key == f"{RUN}/report_pdf/report.pdf"
     # The contract that matters: no URL anywhere in the descriptor.
-    assert not any(
-        isinstance(v, str) and "://" in v for v in published.as_json().values()
-    )
+    assert not any(isinstance(v, str) and "://" in v for v in published.as_json().values())
 
 
 def test_the_bytes_actually_land_where_the_descriptor_says(_local_backend: Path) -> None:
@@ -207,9 +201,7 @@ def test_an_explicit_container_beats_this_librarys_env_var(_local_backend: Path)
     assert published.container == "somewhere-else"
     assert (_local_backend / "somewhere-else" / published.blob_key).is_file()
     # And the descriptor is self-consistent: reminting reads back the same place.
-    assert "somewhere-else" in mint_download_url(
-        blob_key=published.blob_key, container=published.container
-    )
+    assert "somewhere-else" in mint_download_url(blob_key=published.blob_key, container=published.container)
 
 
 def test_an_explicit_account_overrides_the_env_account(

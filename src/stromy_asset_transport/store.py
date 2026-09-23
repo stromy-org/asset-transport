@@ -198,9 +198,7 @@ class AssetStore:
         self._mem_put(key, data)
         return key
 
-    def create_upload_url(
-        self, *, ttl_seconds: int = 3600, content_type: str | None = None
-    ) -> dict[str, object]:
+    def create_upload_url(self, *, ttl_seconds: int = 3600, content_type: str | None = None) -> dict[str, object]:
         """Mint a pre-authorized WRITE URL for an out-of-band upload to a staging blob.
 
         Large inbound binaries can't ride the MCP tool-argument channel (the ~140 KB
@@ -258,9 +256,7 @@ class AssetStore:
         _validate_asset_class(asset_class)
         raw = self._staging_read(blob_key)
         if not raw:
-            raise AssetStoreError(
-                f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?"
-            )
+            raise AssetStoreError(f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?")
         key = hashlib.sha256(raw).hexdigest()
         if expected_sha256 is not None and key != expected_sha256.lower():
             raise AssetStoreError(
@@ -360,10 +356,7 @@ class AssetStore:
     @staticmethod
     def _evict_disk() -> None:
         try:
-            entries = [
-                p for p in DISK_CACHE_DIR.iterdir()
-                if p.is_file() and not p.name.startswith(".")
-            ]
+            entries = [p for p in DISK_CACHE_DIR.iterdir() if p.is_file() and not p.name.startswith(".")]
         except OSError:
             return
         if len(entries) <= _CACHE_MAX_ENTRIES:

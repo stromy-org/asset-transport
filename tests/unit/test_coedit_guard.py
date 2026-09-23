@@ -351,9 +351,7 @@ def test_a_missing_base_digest_fails_closed(graph: _FakeGraph) -> None:
     assert "include_content=True" in (res.conflict.detail or "")
 
 
-def test_an_unreadable_remote_at_conflict_time_fails_closed(
-    graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unreadable_remote_at_conflict_time_fails_closed(graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """If the current version cannot be read, the guard refuses — never proceeds."""
     base_version, base_sha = graph.etag, _sha(graph.content)
     graph.ordinal = 5
@@ -376,9 +374,7 @@ def test_an_unreadable_remote_at_conflict_time_fails_closed(
     assert res.conflict.reason == "remote_unreadable"
 
 
-def test_a_remote_over_the_compare_ceiling_fails_closed(
-    graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_remote_over_the_compare_ceiling_fails_closed(graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """An artifact too large to compare refuses rather than publishing blind."""
     monkeypatch.setenv("RENDER_COEDIT_COMPARE_MAX_BYTES", "4")
     base_version, base_sha = graph.etag, _sha(graph.content)
@@ -392,14 +388,10 @@ def test_a_remote_over_the_compare_ceiling_fails_closed(
     assert "compare ceiling" in (res.conflict.detail or "")
 
 
-def test_a_conflict_does_not_fall_through_to_the_sas_rung(
-    graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_conflict_does_not_fall_through_to_the_sas_rung(graph: _FakeGraph, monkeypatch: pytest.MonkeyPatch) -> None:
     """A refusal is terminal. Rerouting the bytes to a download link would dress a
     refused write up as a delivery — the original failure wearing a new hat."""
-    monkeypatch.setattr(
-        O, "deliver", lambda *a, **k: (_ for _ in ()).throw(AssertionError("SAS rung consulted"))
-    )
+    monkeypatch.setattr(O, "deliver", lambda *a, **k: (_ for _ in ()).throw(AssertionError("SAS rung consulted")))
     base_version, base_sha = graph.etag, _sha(graph.content)
     graph.content = b"changed"
     graph.ordinal = 2
@@ -465,7 +457,7 @@ def test_a_short_write_is_also_unreconcilable(graph: _FakeGraph) -> None:
 
 
 def test_an_unparseable_etag_is_not_treated_as_evidence(graph: _FakeGraph) -> None:
-    """"Cannot tell" must never read as "regression detected" — a detector that
+    """ "Cannot tell" must never read as "regression detected" — a detector that
     fires on an eTag format change would be worse than no detector."""
     original_put = graph._put
 

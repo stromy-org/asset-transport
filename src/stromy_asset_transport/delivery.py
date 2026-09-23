@@ -918,9 +918,7 @@ def _put_conditional_with_lock_retries(
     attempts = 0
     while True:
         attempts += 1
-        resp = _graph_call(
-            url, token=token, method="PUT", data=data, content_type=content_type, if_match=if_match
-        )
+        resp = _graph_call(url, token=token, method="PUT", data=data, content_type=content_type, if_match=if_match)
         if not _is_locked(resp):
             return resp
         if attempts > len(_SHAREPOINT_LOCK_RETRY_DELAYS):
@@ -951,9 +949,7 @@ def _etag_ordinal(etag: str | None) -> tuple[str, int] | None:
     return identity, int(ordinal)
 
 
-def _list_versions_at_path(
-    drive_id: str, encoded_path: str, *, token: str, limit: int = 10
-) -> list[FileVersionInfo]:
+def _list_versions_at_path(drive_id: str, encoded_path: str, *, token: str, limit: int = 10) -> list[FileVersionInfo]:
     """Version timeline for a path-addressed item, for the 412 conflict payload.
 
     The public :func:`list_file_versions` needs a :class:`SharePointFileRef`, and
@@ -1006,9 +1002,13 @@ def _read_content_at_path(
     etag = _as_str(payload.get("eTag"))
     size = _as_int(payload.get("size"))
     if size is not None and size > max_bytes:
-        return None, etag, (
-            f"the current version is {size} bytes, over the {max_bytes}-byte compare "
-            "ceiling (raise RENDER_COEDIT_COMPARE_MAX_BYTES to compare files this large)"
+        return (
+            None,
+            etag,
+            (
+                f"the current version is {size} bytes, over the {max_bytes}-byte compare "
+                "ceiling (raise RENDER_COEDIT_COMPARE_MAX_BYTES to compare files this large)"
+            ),
         )
     download_url = _as_str(payload.get("@microsoft.graph.downloadUrl"))
     if not download_url:
@@ -1053,9 +1053,7 @@ def _safe_segment(name: str) -> str:
     return cleaned or "Deliverables"
 
 
-def _peek_existing(
-    drive_id: str, encoded_path: str, *, token: str, path_for_message: str
-) -> dict[str, object]:
+def _peek_existing(drive_id: str, encoded_path: str, *, token: str, path_for_message: str) -> dict[str, object]:
     """Read what is about to be replaced, so an overwrite is at least RECORDED.
 
     This is the OBSERVATION half, and it predates the guard. It makes an overwrite
@@ -1330,9 +1328,7 @@ def _conditional_sharepoint_write(
     )
 
 
-def _detect_ignored_if_match(
-    item: dict[str, object], *, base_version: str, written: bytes
-) -> str | None:
+def _detect_ignored_if_match(item: dict[str, object], *, base_version: str, written: bytes) -> str | None:
     """Catch Graph silently withdrawing the undocumented ``If-Match`` support.
 
     ``If-Match`` on the content endpoint is **measured, not documented** (probe in
@@ -1460,9 +1456,7 @@ def _resolve_stale_base(
     return _ConditionalWriteOutcome(
         item=item,
         if_match_retried=True,
-        guard_failure=_detect_ignored_if_match(
-            item, base_version=current_etag or base_version, written=data
-        ),
+        guard_failure=_detect_ignored_if_match(item, base_version=current_etag or base_version, written=data),
         notes=[
             "the destination's version had moved but its bytes were unchanged (a "
             "zero-change editor save); republished against the current version"
@@ -1659,16 +1653,8 @@ def _as_bool(value: object) -> bool | None:
 
 def _version_info(payload: dict[str, object]) -> FileVersionInfo:
     modified_by = payload.get("lastModifiedBy")
-    user: object = (
-        cast("dict[str, object]", modified_by).get("user")
-        if isinstance(modified_by, dict)
-        else None
-    )
-    author = (
-        _as_str(cast("dict[str, object]", user).get("displayName"))
-        if isinstance(user, dict)
-        else None
-    )
+    user: object = cast("dict[str, object]", modified_by).get("user") if isinstance(modified_by, dict) else None
+    author = _as_str(cast("dict[str, object]", user).get("displayName")) if isinstance(user, dict) else None
     return FileVersionInfo(
         id=_as_str(payload.get("id")) or "",
         last_modified_at=_as_str(payload.get("lastModifiedDateTime")),
@@ -1734,8 +1720,10 @@ def _path_url(drive_id: str, segments: Sequence[str], *, suffix: str = "") -> st
     if not segments:
         return f"{_GRAPH_BASE}/drives/{drive_id}/root{suffix}"
     encoded = urllib_parse.quote("/".join(segments))
-    return f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:{suffix}" if suffix else (
-        f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}"
+    return (
+        f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}:{suffix}"
+        if suffix
+        else (f"{_GRAPH_BASE}/drives/{drive_id}/root:/{encoded}")
     )
 
 
@@ -1774,15 +1762,10 @@ def _call_with_contention_retry(
             _sleep(advertised if advertised is not None else _SHAREPOINT_LOCK_RETRY_DELAYS[attempt])
     attempts = len(_SHAREPOINT_LOCK_RETRY_DELAYS) + 1
     assert last is not None  # noqa: S101 - the loop only exits here after a response
-    message = (
-        f"{describe} stayed locked/throttled after {attempts} attempts; deferring "
-        "(nothing was written)"
-    )
+    message = f"{describe} stayed locked/throttled after {attempts} attempts; deferring (nothing was written)"
     error_code = _graph_error_code(last.body)
     if _is_locked(last):
-        raise SharePointLockedError(
-            message, status_code=last.status, error_code=error_code, attempts=attempts
-        )
+        raise SharePointLockedError(message, status_code=last.status, error_code=error_code, attempts=attempts)
     raise GraphRequestError(message, status_code=last.status, error_code=error_code)
 
 
@@ -1800,9 +1783,7 @@ def get_file_metadata(ref: SharePointFileRef) -> DriveItemInfo:
     if resp.status == 404:
         raise FileNotFound(str(ref.path))
     if resp.status >= 400:
-        raise GraphRequestError(
-            f"metadata read of {ref.path} → HTTP {resp.status}", status_code=resp.status
-        )
+        raise GraphRequestError(f"metadata read of {ref.path} → HTTP {resp.status}", status_code=resp.status)
     return _item_info(resp.json)
 
 
@@ -1830,9 +1811,7 @@ def read_file(ref: SharePointFileRef, *, max_bytes: int = DEFAULT_READ_MAX_BYTES
     payload = resp.json
     size = _as_int(payload.get("size"))
     if size is not None and size > max_bytes:
-        raise GraphRequestError(
-            f"{ref.path} is {size} bytes, over the {max_bytes}-byte read ceiling"
-        )
+        raise GraphRequestError(f"{ref.path} is {size} bytes, over the {max_bytes}-byte read ceiling")
     download_url = _as_str(payload.get("@microsoft.graph.downloadUrl"))
     if not download_url:
         raise GraphRequestError(f"{ref.path} exposed no download URL (is it a folder?)")
@@ -1844,9 +1823,7 @@ def read_file(ref: SharePointFileRef, *, max_bytes: int = DEFAULT_READ_MAX_BYTES
         with urllib_request.urlopen(req) as content:  # noqa: S310
             data = content.read(max_bytes + 1)
     except urllib_error.HTTPError as exc:
-        raise GraphRequestError(
-            f"content read of {ref.path} → HTTP {exc.code}", status_code=exc.code
-        ) from exc
+        raise GraphRequestError(f"content read of {ref.path} → HTTP {exc.code}", status_code=exc.code) from exc
     except urllib_error.URLError as exc:
         # Deliberately does not interpolate the URL — it is a live credential.
         raise GraphRequestError(f"content read of {ref.path} failed") from exc
@@ -1899,15 +1876,11 @@ def list_children(
         # `$top` (carried into every nextLink) should make this impossible. If it
         # ever happens, fail loudly: silently slicing would drop items the cursor
         # can never return, which reads as "that is the whole history".
-        raise GraphRequestError(
-            f"listing returned {len(items)} children over the requested limit of {limit}"
-        )
+        raise GraphRequestError(f"listing returned {len(items)} children over the requested limit of {limit}")
     return items, _as_str(payload.get("@odata.nextLink"))
 
 
-def list_file_versions(
-    ref: SharePointFileRef, *, limit: int = LIST_VERSIONS_MAX_LIMIT
-) -> list[FileVersionInfo]:
+def list_file_versions(ref: SharePointFileRef, *, limit: int = LIST_VERSIONS_MAX_LIMIT) -> list[FileVersionInfo]:
     """Return a file's recent version timeline, newest first.
 
     This is the read a co-edit reconciliation needs and
@@ -1938,20 +1911,14 @@ def list_file_versions(
     drive_id = _resolve_drive_id(ref.target, token)
     url = _path_url(drive_id, (*_base_segments(ref.target), *ref.segments), suffix="/versions")
     url = f"{url}?$top={limit}"
-    resp = _call_with_contention_retry(
-        f"version listing of {ref.path}", lambda: _graph_call(url, token=token)
-    )
+    resp = _call_with_contention_retry(f"version listing of {ref.path}", lambda: _graph_call(url, token=token))
     if resp.status == 404:
         raise FileNotFound(str(ref.path))
     if resp.status >= 400:
-        raise GraphRequestError(
-            f"version listing of {ref.path} → HTTP {resp.status}", status_code=resp.status
-        )
+        raise GraphRequestError(f"version listing of {ref.path} → HTTP {resp.status}", status_code=resp.status)
     raw_values = resp.json.get("value")
     values = cast("list[object]", raw_values) if isinstance(raw_values, list) else []
-    versions = [
-        _version_info(cast("dict[str, object]", v)) for v in values if isinstance(v, dict)
-    ]
+    versions = [_version_info(cast("dict[str, object]", v)) for v in values if isinstance(v, dict)]
     # Graph returns versions newest-first, but that ordering is not contractual and
     # a reconciliation that walks the list backwards would silently fold the wrong
     # edits. Sort on the one field that is unambiguous.
@@ -1992,15 +1959,12 @@ def ensure_folder(target: SharePointTarget, segments: Sequence[str]) -> DriveIte
             current = _item_info(probe.json)
             if not current.is_folder:
                 raise GraphRequestError(
-                    f"{'/'.join(chain)} exists but is a file; refusing to file a "
-                    "deliverable under it"
+                    f"{'/'.join(chain)} exists but is a file; refusing to file a deliverable under it"
                 )
             parent_id = current.id
             continue
         if probe.status != 404:
-            raise GraphRequestError(
-                f"probing {'/'.join(chain)} → HTTP {probe.status}", status_code=probe.status
-            )
+            raise GraphRequestError(f"probing {'/'.join(chain)} → HTTP {probe.status}", status_code=probe.status)
 
         if parent_id:
             # Address the parent by the id the probe just returned.
@@ -2009,9 +1973,7 @@ def ensure_folder(target: SharePointTarget, segments: Sequence[str]) -> DriveIte
             # First level: the parent is the target's base folder (or the drive
             # root when the target declares no base path).
             create_url = _path_url(drive_id, base, suffix="/children")
-        body = json.dumps(
-            {"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
-        ).encode("utf-8")
+        body = json.dumps({"name": segment, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}).encode("utf-8")
         created = _call_with_contention_retry(
             f"creating folder {segment!r}",
             lambda url=create_url, payload=body: _graph_call(
@@ -2025,16 +1987,13 @@ def ensure_folder(target: SharePointTarget, segments: Sequence[str]) -> DriveIte
             )
             if reprobe.status != 200:
                 raise GraphRequestError(
-                    f"folder {'/'.join(chain)} reported a conflict but could not be resolved "
-                    f"(HTTP {reprobe.status})"
+                    f"folder {'/'.join(chain)} reported a conflict but could not be resolved (HTTP {reprobe.status})"
                 )
             current = _item_info(reprobe.json)
             if not current.is_folder:
                 raise GraphRequestError(f"{'/'.join(chain)} exists but is a file")
         elif created.status >= 400:
-            raise GraphRequestError(
-                f"creating {'/'.join(chain)} → HTTP {created.status}", status_code=created.status
-            )
+            raise GraphRequestError(f"creating {'/'.join(chain)} → HTTP {created.status}", status_code=created.status)
         else:
             current = _item_info(created.json)
         parent_id = current.id
@@ -2064,9 +2023,7 @@ def create_file_once(
         raise ValueError("create_file_once: refusing to create an empty file")
     actual = hashlib.sha256(data).hexdigest()
     if digest != actual:
-        raise ValueError(
-            f"create_file_once: digest {digest!r} does not match the payload ({actual!r})"
-        )
+        raise ValueError(f"create_file_once: digest {digest!r} does not match the payload ({actual!r})")
     _require_allowed(ref.target)
     token = _graph_token()
     drive_id = _resolve_drive_id(ref.target, token)
@@ -2082,8 +2039,7 @@ def create_file_once(
         if hashlib.sha256(existing).hexdigest() == digest:
             return get_file_metadata(ref)
         raise IdempotencyCollision(
-            f"{ref.path} already exists with different content; refusing to overwrite a "
-            "client-readable record"
+            f"{ref.path} already exists with different content; refusing to overwrite a client-readable record"
         )
     if resp.status >= 400:
         raise GraphRequestError(f"create of {ref.path} → HTTP {resp.status}", status_code=resp.status)
