@@ -1,22 +1,181 @@
-# Thin caller for the versioned control-plane engine. Keep behavior in stromy-org,
-# and archetype-specific regeneration in scripts/post-copier-update.sh.
-name: Scheduled template sync
+name: Copier update
+
+# Runs `copier update` against the python-library-template HEAD on a
+# schedule, opens a PR with the chrome-only diff, and NEVER auto-merges — a
+# human reviews + merges. On a merge conflict (`.rej` files present) it
+# files/updates a single tracking issue instead of a broken PR. This
+# workflow itself is CHROME, so it flows down to every satellite via the
+# very updates it opens. Mirrors fastmcp-template's copier-update.yml with
+# two fixes: (a) the template repo is PRIVATE, so the App token must be
+# wired into git's credential resolution *before* copier clones it; (b) a
+# genuine `copier update` failure fails this job — only a detected merge
+# conflict (`.rej` files) is treated as the expected, non-fatal outcome.
 
 on:
   schedule:
-    - cron: "0 7 * * 2"
-  workflow_dispatch:
+    # Weekly, Tuesday 06:30 UTC (staggered from the org routine fleet).
+    - cron: "30 6 * * 2"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
   pull-requests: write
   issues: write
 
+concurrency:
+  group: copier-update
+  cancel-in-progress: false
+
 jobs:
   copier-update:
-    uses: stromy-org/stromy-org/.github/workflows/copier-update.yml@copier-fleet-v1
-    with:
-      template-name: python-library-template
-      engine-ref: copier-fleet-v1
-    secrets: inherit
+    runs-on: ubuntu-latest
+    # `secrets` is NOT a valid context in a step-level `if:` — surface CI_APP_ID
+    # through a job-level env so the App-token step can gate on its presence
+    # (`env` IS valid in `if:`). Without this the workflow fails to compile.
+    env:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+    steps:
+      # The org stromy-ci App token: clones the private template and authors
+      # the PR/issue. No-op-safe if the App secrets are absent — the step
+      # falls back to GITHUB_TOKEN (which can still open a same-repo PR, but
+      # CANNOT clone the private template — see the auth step below).
+      - name: Generate stromy-ci App token
+        id: app-token
+        if: ${{ env.CI_APP_ID != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Explicit scope: the token pushes/opens a PR on THIS repo and
+          # clones the private `python-library-template` — both must be listed.
+          # With create-github-app-token@v2, `owner` without `repositories`
+          # does NOT grant the whole installation (unlike @v1) — verified
+          # live 2026-08-07: the minted token could not see the template.
+          repositories: |
+            ${{ github.event.repository.name }}
+            python-library-template
 
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          fetch-depth: 0
+
+      # A satellite with no App token cannot read the private template, so the
+      # only honest outcomes are "skipped" or "did the work" — never "failed".
+      # Before this gate existed the token step skipped correctly and every
+      # LATER step ran anyway, so `copier update` shelled out to an
+      # unauthenticated `git ls-remote` and the job died red with
+      # "Repository not found". Measured 2026-09-05: four PUBLIC satellites
+      # (asset-transport, stromy-byok, workflow-runtime-core,
+      # stromy-workflows-mcp) had been failing that way on every weekly run,
+      # indistinguishable from a real breakage. A permanently-red alarm nobody
+      # can act on is the documented way a gate gets trained away.
+      - name: Check token availability
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ -z "${{ steps.app-token.outputs.token }}" ]; then
+            echo "::warning title=Copier update skipped::No stromy-ci App token available for ${{ github.repository }}. Expected on a PUBLIC satellite — the CI_APP org secrets are scoped to private repos only (ci-secret-scope.json), so this repo can never authenticate to the private template. Its updates arrive by push instead, from stromy-org's push-template-sync.yml. This run did nothing."
+            {
+              echo "### Copier update: SKIPPED"
+              echo ""
+              echo "No \`stromy-ci\` App token available — cannot authenticate to the"
+              echo "private \`python-library-template\` repo. Nothing was done."
+              echo ""
+              echo "This is expected on a public satellite; template updates reach it"
+              echo "via \`push-template-sync.yml\` in stromy-org."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        if: steps.gate.outputs.ok == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      # Fix (a): python-library-template is a PRIVATE repo. `copier update`
+      # shells out to `git clone` under the hood using the plain HTTPS URL
+      # recorded in .copier-answers.yml (_src_path: gh:stromy-org/...) — that
+      # clone has no credentials of its own and 404s on a private repo unless
+      # git itself is told to inject the App token for any stromy-org URL.
+      - name: Authenticate git clones of the (private) template with the App token
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/stromy-org/".insteadOf "https://github.com/stromy-org/"
+
+      - name: Run copier update
+        id: update
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+        run: |
+          set -uo pipefail
+          git config user.name "stromy-ci[bot]"
+          git config user.email "stromy-ci[bot]@users.noreply.github.com"
+
+          # Fix (b): deliberately NOT `|| true`. `copier update` can exit
+          # non-zero for two different reasons — a genuine failure (bad
+          # template ref, broken _tasks, auth failure) or a merge conflict
+          # that leaves `.rej` files behind. Only the second is expected and
+          # non-fatal; we tell them apart below instead of swallowing both.
+          # --skip-answered keeps the recorded answers; --trust runs template _tasks.
+          uvx copier update --trust --skip-answered --defaults
+          update_exit=$?
+
+          if find . -name '*.rej' -not -path './.git/*' | grep -q .; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$update_exit" -ne 0 ] && [ "$(find . -name '*.rej' -not -path './.git/*' | wc -l)" -eq 0 ]; then
+            echo "::error::copier update failed (exit $update_exit) with no .rej conflict markers — genuine failure, not a conflict."
+            exit "$update_exit"
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open update PR (never auto-merge)
+        if: steps.gate.outputs.ok == 'true' && steps.update.outputs.changed == 'true' && steps.update.outputs.conflict == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          branch: chore/copier-update
+          delete-branch: true
+          commit-message: "chore: ⬆️ Adopt python-library-template updates (copier update)"
+          title: "chore: ⬆️ Adopt python-library-template updates"
+          labels: scheduled-routine
+          body: |
+            Automated `copier update` from the `python-library-template` HEAD.
+            Review the **chrome-only** diff and merge — this PR is **never**
+            auto-merged.
+
+            If this diff touches your library's own source, dependencies, or
+            version, STOP — updates from this template must only touch
+            chrome (workflows, scripts, docs, config). Report it.
+
+      - name: File conflict tracking issue
+        if: steps.gate.outputs.ok == 'true' && steps.update.outputs.conflict == 'true'
+        env:
+          # In-repo issue writes use the workflow's own token — the
+          # permissions block above already grants it; the stromy-ci App
+          # deliberately lacks Issues permission (verified 2026-08-06:
+          # createIssue 403'd on fetch-kit-mcp's copier-update conflict path).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="copier update: merge conflicts need manual reconciliation"
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          BODY="\`copier update\` produced \`.rej\` merge rejects that need a human. Run \`uvx copier update --trust\` locally, resolve the \`.rej\` files (template chrome wins; keep your library's own source), and open the PR by hand."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Re-detected on $(date -u +%Y-%m-%d). $BODY"
+          else
+            gh issue create --title "$TITLE" --label scheduled-routine --body "$BODY"
+          fi
