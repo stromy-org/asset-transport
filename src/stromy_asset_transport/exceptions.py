@@ -16,8 +16,7 @@ class DependencyError(StromyAssetTransportError):
 
     def __init__(self, extra: str, package: str) -> None:
         super().__init__(
-            f"Missing optional dependency '{package}'. Install with: "
-            f"uv pip install 'stromy-asset-transport[{extra}]'"
+            f"Missing optional dependency '{package}'. Install with: uv pip install 'stromy-asset-transport[{extra}]'"
         )
         self.extra = extra
         self.package = package

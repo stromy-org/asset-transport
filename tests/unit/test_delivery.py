@@ -674,9 +674,7 @@ def test_delivery_records_the_version_it_overwrote(monkeypatch):
     monkeypatch.setattr(
         O.urllib_request,
         "urlopen",
-        _existing_item_urlopen(
-            {"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}
-        ),
+        _existing_item_urlopen({"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}),
     )
 
     res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
@@ -754,14 +752,10 @@ def test_deliver_artifact_surfaces_the_overwrite_on_the_result(monkeypatch):
     monkeypatch.setattr(
         O.urllib_request,
         "urlopen",
-        _existing_item_urlopen(
-            {"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}
-        ),
+        _existing_item_urlopen({"id": "item-1", "eTag": '"item-1,7"', "lastModifiedDateTime": "2026-07-29T18:00:00Z"}),
     )
 
-    result = O.deliver_artifact(
-        b"deck-bytes", filename="d.pptx", inline_max=0, prefer_sharepoint=True
-    )
+    result = O.deliver_artifact(b"deck-bytes", filename="d.pptx", inline_max=0, prefer_sharepoint=True)
 
     assert result.mode == "sharepoint"
     assert result.replaced_existing is True

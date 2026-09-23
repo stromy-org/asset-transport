@@ -45,9 +45,7 @@ DEFAULT_OUTPUT_CONTAINER = "workflow-outputs"
 
 #: Read URLs are short-lived by default. A client fetches results interactively,
 #: and a long-lived URL is an unauthenticated capability sitting in a transcript.
-DEFAULT_DOWNLOAD_TTL_SECONDS = int(
-    os.environ.get("WORKFLOW_DOWNLOAD_URL_TTL_SECONDS", "900")
-)
+DEFAULT_DOWNLOAD_TTL_SECONDS = int(os.environ.get("WORKFLOW_DOWNLOAD_URL_TTL_SECONDS", "900"))
 
 _SAFE_SEGMENT_RE = re.compile(r"[^a-z0-9._-]+")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -118,16 +116,10 @@ def artifact_blob_key(*, run_id: str, logical_name: str, filename: str) -> str:
         # non-UUID here means the caller passed something else entirely, and
         # slugifying it would bury that bug under a plausible-looking key.
         raise AssetStoreError(f"run_id {run_id!r} is not a UUID")
-    return (
-        f"{run_id}/"
-        f"{_safe_segment(logical_name, what='logical name')}/"
-        f"{_safe_segment(filename, what='filename')}"
-    )
+    return f"{run_id}/{_safe_segment(logical_name, what='logical name')}/{_safe_segment(filename, what='filename')}"
 
 
-def _container_client(
-    *, ensure: bool, account: str | None = None, container: str | None = None
-) -> tuple[Any, str]:
+def _container_client(*, ensure: bool, account: str | None = None, container: str | None = None) -> tuple[Any, str]:
     svc, _account = build_azure_service(account)
     if svc is None:
         raise AssetStoreError(
@@ -169,9 +161,7 @@ def publish_artifact(
             "artifact would report success while delivering nothing"
         )
     digest = hashlib.sha256(raw).hexdigest()
-    blob_key = artifact_blob_key(
-        run_id=run_id, logical_name=logical_name, filename=filename
-    )
+    blob_key = artifact_blob_key(run_id=run_id, logical_name=logical_name, filename=filename)
 
     resolved_container = output_container(container)
 
@@ -182,9 +172,7 @@ def publish_artifact(
         if not (dest.is_file() and hashlib.sha256(dest.read_bytes()).hexdigest() == digest):
             dest.write_bytes(raw)
     else:
-        client, _name = _container_client(
-            ensure=True, account=account, container=resolved_container
-        )
+        client, _name = _container_client(ensure=True, account=account, container=resolved_container)
         blob = client.get_blob_client(blob_key)
         if not _already_published(blob, digest):
             try:

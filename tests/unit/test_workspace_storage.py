@@ -55,9 +55,7 @@ class FakeDrive:
         self.versions: dict[str, list[dict[str, object]]] = {}
         self._next_id = 0
 
-    def add_version(
-        self, path: str, *, vid: str, when: str, author: str | None, email: str | None = None
-    ) -> None:
+    def add_version(self, path: str, *, vid: str, when: str, author: str | None, email: str | None = None) -> None:
         entry: dict[str, object] = {"id": vid, "lastModifiedDateTime": when, "size": 10}
         if author is not None:
             user: dict[str, object] = {"displayName": author}
@@ -167,9 +165,7 @@ class FakeDrive:
             return locked
         if path not in self.items:
             return O.GraphResponse(status=404, headers={}, body=b'{"error":{"code":"itemNotFound"}}')
-        return O.GraphResponse(
-            status=200, headers={}, body=json.dumps(self._payload(path)).encode()
-        )
+        return O.GraphResponse(status=200, headers={}, body=json.dumps(self._payload(path)).encode())
 
     def _versions(self, path: str, query: str = "") -> O.GraphResponse:
         """Serve a seeded version history, honouring `$top`.
@@ -181,9 +177,7 @@ class FakeDrive:
             return O.GraphResponse(status=404, headers={}, body=b'{"error":{"code":"itemNotFound"}}')
         top = int(urllib_parse.parse_qs(query).get("$top", ["50"])[0])
         entries = self.versions.get(path, [])
-        return O.GraphResponse(
-            status=200, headers={}, body=json.dumps({"value": entries[:top]}).encode()
-        )
+        return O.GraphResponse(status=200, headers={}, body=json.dumps({"value": entries[:top]}).encode())
 
     def _children(self, path: str, query: str = "") -> O.GraphResponse:
         """Honour `$top` and `$skip` exactly as Graph does, including `@odata.nextLink`."""
@@ -193,11 +187,7 @@ class FakeDrive:
         top = int(params.get("$top", ["50"])[0])
         skip = int(params.get("$skip", ["0"])[0])
         prefix = f"{path}/" if path else ""
-        names = [
-            p
-            for p in sorted(self.items)
-            if p.startswith(prefix) and "/" not in p[len(prefix) :] and p != path
-        ]
+        names = [p for p in sorted(self.items) if p.startswith(prefix) and "/" not in p[len(prefix) :] and p != path]
         page = names[skip : skip + top]
         payload: dict[str, object] = {"value": [self._payload(p) for p in page]}
         if skip + top < len(names):
@@ -209,17 +199,13 @@ class FakeDrive:
 
     def _create_child(self, parent_path: str, data: bytes | None) -> O.GraphResponse:
         payload = json.loads(data or b"{}")
-        assert payload.get("@microsoft.graph.conflictBehavior") == "fail", (
-            "folder creation must never silently rename"
-        )
+        assert payload.get("@microsoft.graph.conflictBehavior") == "fail", "folder creation must never silently rename"
         name = payload["name"]
         path = f"{parent_path}/{name}" if parent_path else name
         if path in self.items:
             return O.GraphResponse(status=409, headers={}, body=b'{"error":{"code":"nameAlreadyExists"}}')
         self.add_folder(path)
-        return O.GraphResponse(
-            status=201, headers={}, body=json.dumps(self._payload(path)).encode()
-        )
+        return O.GraphResponse(status=201, headers={}, body=json.dumps(self._payload(path)).encode())
 
     def _put_content(self, path: str, data: bytes | None, query: str) -> O.GraphResponse:
         assert "conflictBehavior=fail" in query, "create-only writes must not replace"
@@ -229,9 +215,7 @@ class FakeDrive:
         if path in self.items:
             return O.GraphResponse(status=409, headers={}, body=b'{"error":{"code":"nameAlreadyExists"}}')
         self.add_file(path, data or b"")
-        return O.GraphResponse(
-            status=201, headers={}, body=json.dumps(self._payload(path)).encode()
-        )
+        return O.GraphResponse(status=201, headers={}, body=json.dumps(self._payload(path)).encode())
 
 
 @pytest.fixture
@@ -327,9 +311,7 @@ def test_get_file_metadata_missing_is_typed(drive: FakeDrive) -> None:
         O.get_file_metadata(O.SharePointFileRef.of(_target(), "nope.json"))
 
 
-def test_read_file_uses_the_download_url_without_our_token(
-    drive: FakeDrive, download: list[dict[str, object]]
-) -> None:
+def test_read_file_uses_the_download_url_without_our_token(drive: FakeDrive, download: list[dict[str, object]]) -> None:
     drive.add_file("Proj/event.json", b'{"kind":"milestone"}')
     data = O.read_file(O.SharePointFileRef.of(_target(), "Proj", "event.json"))
     assert data == b'{"kind":"milestone"}'
@@ -358,9 +340,7 @@ def test_list_children_is_bounded_by_the_requested_limit(drive: FakeDrive) -> No
         drive.add_file(f"Proj/e{i}.json", b"{}")
     items, cursor = O.list_children(_target(), ["Proj"], limit=3)
     assert len(items) == 3
-    assert [c for c in drive.calls if "$top=3" in c[1]], (
-        "the limit is pushed to Graph, not applied only client-side"
-    )
+    assert [c for c in drive.calls if "$top=3" in c[1]], "the limit is pushed to Graph, not applied only client-side"
     # The rest is reachable ONLY through the returned cursor — history is paged,
     # never returned unbounded in one call.
     assert cursor is not None
@@ -404,9 +384,7 @@ def test_ensure_folder_is_idempotent(drive: FakeDrive) -> None:
     assert drive.items == before
 
 
-def test_ensure_folder_survives_a_concurrent_create(
-    monkeypatch: pytest.MonkeyPatch, drive: FakeDrive
-) -> None:
+def test_ensure_folder_survives_a_concurrent_create(monkeypatch: pytest.MonkeyPatch, drive: FakeDrive) -> None:
     """A 409 means a sibling session won the race — re-resolve, never rename."""
     original_create = drive._create_child
     raced: dict[str, bool] = {}
@@ -452,9 +430,7 @@ def test_create_file_once_creates(drive: FakeDrive) -> None:
     assert drive.items["Proj/workspace-events/e1.json"]["content"] == body
 
 
-def test_identical_replay_creates_no_second_record(
-    drive: FakeDrive, download: list[dict[str, object]]
-) -> None:
+def test_identical_replay_creates_no_second_record(drive: FakeDrive, download: list[dict[str, object]]) -> None:
     body = b'{"kind":"milestone"}'
     ref = O.SharePointFileRef.of(_target(), "Proj", "e1.json")
     first = O.create_file_once(ref, body, digest=_digest(body))
@@ -466,9 +442,7 @@ def test_identical_replay_creates_no_second_record(
     assert len([c for c in drive.calls if c[0] == "PUT"]) == writes_before + 1
 
 
-def test_different_content_at_the_same_key_collides(
-    drive: FakeDrive, download: list[dict[str, object]]
-) -> None:
+def test_different_content_at_the_same_key_collides(drive: FakeDrive, download: list[dict[str, object]]) -> None:
     ref = O.SharePointFileRef.of(_target(), "Proj", "e1.json")
     O.create_file_once(ref, b'{"v":1}', digest=_digest(b'{"v":1}'))
     with pytest.raises(O.IdempotencyCollision):
@@ -512,9 +486,7 @@ def test_a_persistent_lock_defers_without_writing(drive: FakeDrive) -> None:
 
 def test_base_path_is_prefixed_to_every_addressed_path(drive: FakeDrive) -> None:
     drive.add_file("Client Deliverables/Proj/e1.json", b"{}")
-    info = O.get_file_metadata(
-        O.SharePointFileRef.of(_target(base_path="Client Deliverables"), "Proj", "e1.json")
-    )
+    info = O.get_file_metadata(O.SharePointFileRef.of(_target(base_path="Client Deliverables"), "Proj", "e1.json"))
     assert info.name == "e1.json"
 
 
@@ -559,9 +531,7 @@ def test_version_listing_is_capped_and_asks_graph_for_the_cap(drive: FakeDrive) 
     drive.add_file("Proj/deck.pptx", b"x")
     for n in range(O.LIST_VERSIONS_MAX_LIMIT + 10):
         drive.add_version("Proj/deck.pptx", vid=f"{n}.0", when=f"2026-07-30T10:{n:02d}:00Z", author="A")
-    versions = O.list_file_versions(
-        O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"), limit=999
-    )
+    versions = O.list_file_versions(O.SharePointFileRef.of(_target(), "Proj", "deck.pptx"), limit=999)
     assert len(versions) == O.LIST_VERSIONS_MAX_LIMIT
     assert f"$top={O.LIST_VERSIONS_MAX_LIMIT}" in drive.calls[-1][1]
 
@@ -573,7 +543,5 @@ def test_versions_of_a_missing_file_raise_file_not_found(drive: FakeDrive) -> No
 
 def test_versions_never_reach_graph_for_an_off_allowlist_target(drive: FakeDrive) -> None:
     with pytest.raises(O.TargetNotAllowed):
-        O.list_file_versions(
-            O.SharePointFileRef.of(_target(site_id=OFF_ALLOWLIST), "Proj", "deck.pptx")
-        )
+        O.list_file_versions(O.SharePointFileRef.of(_target(site_id=OFF_ALLOWLIST), "Proj", "deck.pptx"))
     assert drive.calls == []
