@@ -34,14 +34,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import IO, cast
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -305,6 +307,12 @@ class DeliveryResult:
     #: re-PUT once against the current eTag. This is also the signal that answers
     #: "does a web-editor open bump the eTag?" from live traffic.
     if_match_retried: bool = False
+    #: Cleanup receipt for a caller-brokered ``graph-upload-session`` that this
+    #: call failed to fill: ``"cancelled"`` or ``"cancel_failed"`` once
+    #: :func:`cancel_upload_session` was attempted, ``None`` when no attempt was
+    #: made (no caller URL, a committed push, or a ``presigned-put`` target).
+    #: Carried into every fallback result so the caller never cancels twice.
+    upload_session_status: str | None = None
     warnings: list[str] = field(default_factory=_empty_str_list)
 
 
@@ -359,6 +367,7 @@ def deliver_artifact(
     sha = hashlib.sha256(raw).hexdigest()
     size = len(raw)
     warnings: list[str] = []
+    upload_session_status: str | None = None
 
     # 1. Caller-brokered push to a pre-authorized URL (e.g. a Graph upload session
     #    minted by the client). The bytes never touch our credentials.
@@ -367,6 +376,12 @@ def deliver_artifact(
             pushed = push_to_url(raw, upload_url=upload_url, kind=upload_kind, total_size=total_size)
         except OutputStoreError as e:
             warnings.append(f"caller-brokered push failed: {e}; falling back to the download ladder")
+            if upload_kind == "graph-upload-session":
+                # The session still reserves its filename until it expires; release
+                # it now rather than leaving the next attempt a 409.
+                upload_session_status = "cancelled" if cancel_upload_session(upload_url) else "cancel_failed"
+                if upload_session_status == "cancel_failed":
+                    warnings.append("the unfilled upload session could not be cancelled; it expires on its own")
         else:
             result = DeliveryResult(
                 mode="pushed",
@@ -400,6 +415,7 @@ def deliver_artifact(
             sha256=sha,
             size=size,
             inline_b64=base64.b64encode(raw).decode("ascii"),
+            upload_session_status=upload_session_status,
             warnings=warnings,
         )
 
@@ -428,6 +444,7 @@ def deliver_artifact(
                 failure_code="sharepoint_locked",
                 retryable=True,
                 attempts=e.attempts,
+                upload_session_status=upload_session_status,
                 warnings=warnings,
             )
         except OutputStoreError as e:
@@ -453,6 +470,7 @@ def deliver_artifact(
                     replaced_etag=_as_str(sp.get("replaced_etag")),
                     replaced_last_modified_at=_as_str(sp.get("replaced_last_modified_at")),
                     replaced_existing=_as_bool(sp.get("replaced_existing")),
+                    upload_session_status=upload_session_status,
                     warnings=warnings,
                 )
             guard_failure = _as_str(sp.get("guard_failure"))
@@ -479,6 +497,7 @@ def deliver_artifact(
                 forced=force,
                 base_version_absent=base_version is None,
                 if_match_retried=bool(sp.get("if_match_retried")),
+                upload_session_status=upload_session_status,
                 warnings=warnings,
             )
 
@@ -495,6 +514,7 @@ def deliver_artifact(
             size=size,
             download_url=_as_str(sas.get("download_url")),
             url_expires_at=_as_str(sas.get("url_expires_at")),
+            upload_session_status=upload_session_status,
             warnings=warnings,
         )
 
@@ -506,7 +526,9 @@ def deliver_artifact(
         f"no delivery backend configured for a {size}-byte artifact over "
         f"inline_max={inline_max}; not delivered (use a server-local path)"
     )
-    return DeliveryResult(mode="none", sha256=sha, size=size, warnings=warnings)
+    return DeliveryResult(
+        mode="none", sha256=sha, size=size, upload_session_status=upload_session_status, warnings=warnings
+    )
 
 
 def _as_str(value: object) -> str | None:
@@ -516,6 +538,96 @@ def _as_str(value: object) -> str | None:
 # ── caller-brokered push ──────────────────────────────────────────────────────
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "::1"})
+
+
+def _is_loopback(host: str) -> bool:
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_upload_target(upload_url: str) -> str | None:
+    """Return why ``upload_url`` is not a usable caller-brokered target, or ``None``.
+
+    A target is HTTPS (plain HTTP only for a loopback host, for local test
+    servers), names a host, and carries no userinfo. There is deliberately no host
+    allowlist: the URL is the caller's own pre-authorized destination, and Graph
+    upload hosts vary by tenant, cloud and account type. The reason never contains
+    the URL, because an upload URL is a credential.
+    """
+    if not upload_url:
+        return "upload_url is missing"
+    try:
+        parsed = urllib_parse.urlsplit(upload_url)
+        host = parsed.hostname or ""
+    except ValueError:
+        return "upload_url is not a valid URL"
+    if parsed.username is not None or parsed.password is not None:
+        return "upload_url must not carry userinfo"
+    if not host:
+        return "upload_url has no host"
+    if parsed.scheme == "https":
+        return None
+    if parsed.scheme == "http" and _is_loopback(host):
+        return None
+    return "upload_url must use https"
+
+
+class _NoRedirect(urllib_request.HTTPRedirectHandler):
+    """Refuse every redirect: a pre-authorized URL is used exactly as minted."""
+
+    def redirect_request(  # noqa: PLR0913
+        self,
+        req: urllib_request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> urllib_request.Request | None:
+        return None
+
+
+def cancel_upload_session(upload_url: str, *, timeout: float = 10) -> bool:
+    """Cancel a Graph upload session the caller minted; never raise.
+
+    Microsoft documents cancellation as an unauthenticated ``DELETE`` on the
+    session's ``uploadUrl`` (204). It discards the session's temporary upload
+    state; it does not promise the filename is reusable at once. Returns ``True``
+    on 204 or 404 (the session no longer exists) and ``False`` on any other
+    status, an invalid target or a network failure. Nothing here logs or echoes
+    the URL.
+    """
+    if validate_upload_target(upload_url) is not None:
+        return False
+    req = urllib_request.Request(upload_url, method="DELETE")  # noqa: S310
+    opener = urllib_request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", resp.getcode())
+    except urllib_error.HTTPError as exc:
+        status = exc.code
+    except Exception:  # noqa: BLE001 — best-effort cleanup must never raise
+        return False
+    return status in (204, 404)
+
+
+def _graph_push_committed(status: int, payload: object) -> bool:
+    """A single-PUT Graph upload is committed only on 200/201 with a drive item id.
+
+    202 means Graph is still expecting ranges (``nextExpectedRanges``): the
+    session is open and nothing was created.
+    """
+    if status not in (200, 201) or not isinstance(payload, dict):
+        return False
+    item_id = cast("dict[str, object]", payload).get("id")
+    return isinstance(item_id, str) and bool(item_id)
+
+
 def push_to_url(
     raw: bytes,
     *,
@@ -523,13 +635,20 @@ def push_to_url(
     kind: str = "graph-upload-session",
     total_size: int | None = None,
 ) -> dict[str, object]:
-    """PUT bytes to a pre-authorized upload URL without our own credentials."""
+    """PUT bytes to a pre-authorized upload URL without our own credentials.
+
+    Raises :class:`OutputStoreError` on an invalid target, a failed PUT, or a
+    Graph response that does not prove the file was committed.
+    """
     size = total_size if total_size is not None else len(raw)
     if size != len(raw):
         raise OutputStoreError(f"push_to_url size mismatch: payload is {len(raw)} bytes but total_size={size}")
 
+    problem = validate_upload_target(upload_url)
+    if problem is not None:
+        raise OutputStoreError(f"{kind} target refused: {problem}")
     parsed = urllib_parse.urlparse(upload_url)
-    host = parsed.netloc or "unknown-host"
+    host = parsed.hostname or "unknown-host"
 
     if kind == "graph-upload-session":
         single_put_limit = 60 * 1024 * 1024
@@ -561,11 +680,18 @@ def push_to_url(
         raise OutputStoreError(f"{kind} PUT to {host} failed: {reason}") from exc
 
     result: dict[str, object] = {"delivered_via": kind, "status_code": status}
+    payload: object = None
     if body:
         try:
-            payload: object = json.loads(body)
+            payload = json.loads(body)
         except json.JSONDecodeError:
             payload = None
+    if kind == "graph-upload-session" and not _graph_push_committed(status, payload):
+        raise OutputStoreError(
+            f"{kind} PUT to {host} returned HTTP {status} without a committed drive item; "
+            "the upload session is incomplete"
+        )
+    if body:
         if isinstance(payload, dict):
             payload_d = cast("dict[str, object]", payload)
             web_url = payload_d.get("webUrl")

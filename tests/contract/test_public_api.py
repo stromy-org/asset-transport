@@ -98,3 +98,16 @@ def test_the_guard_args_are_keyword_only_with_preserving_defaults() -> None:
 def test_delivery_result_carries_the_guard_fields() -> None:
     fields = {f.name for f in dataclasses.fields(stromy_asset_transport.DeliveryResult)}
     assert {"conflict", "forced", "base_version_absent", "if_match_retried"} <= fields
+
+
+def test_upload_session_cleanup_public_api_present() -> None:
+    for symbol in ("cancel_upload_session", "validate_upload_target"):
+        assert symbol in stromy_asset_transport.__all__
+    fields = stromy_asset_transport.DeliveryResult.__dataclass_fields__
+    assert fields["upload_session_status"].default is None
+
+
+def test_version_matches_package_metadata() -> None:
+    from importlib.metadata import version
+
+    assert stromy_asset_transport.__version__ == version("stromy-asset-transport")

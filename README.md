@@ -160,6 +160,23 @@ Contract:
   as `failure_code="sharepoint_locked"`) for a lock, or `GraphRequestError` for a
   pure throttle. Nothing is written after a defer.
 
+## Caller-brokered uploads and reservation cleanup
+
+`deliver_artifact(..., upload_url=..., upload_kind="graph-upload-session")` PUTs the
+bytes to a Microsoft Graph upload session the caller minted. A Graph session reserves
+its filename until it is filled, cancelled or expires, so a failed push is followed by
+`cancel_upload_session(upload_url)` (Microsoft's documented unauthenticated `DELETE`)
+and the result records `upload_session_status`: `"cancelled"`, `"cancel_failed"`, or
+`None` when nothing was attempted (no caller URL, a committed push, or a
+`presigned-put` target). Cancellation is best-effort and does not guarantee the
+filename is reusable at once; callers still handle a conflict.
+
+A Graph push counts as committed only on 200/201 with a drive-item id; a 202 (still
+expecting ranges) or an id-less body raises `OutputStoreError`. `validate_upload_target`
+is the one predicate for both requests: HTTPS (plain HTTP only for loopback test
+servers), a host, no userinfo; redirects are never followed. Upload URLs are
+credentials, so no message, warning or log line contains one.
+
 ## Tests
 
 ```bash
@@ -171,9 +188,8 @@ uv run pytest tests/contract
 
 This library is consumed by downstream repos via `[tool.uv.sources]` git+URL pins. To cut a release:
 
-1. Bump `[project].version` in `pyproject.toml` on `main`.
-2. `git tag vX.Y.Z && git push --tags`
-3. CI builds + publishes a GitHub Release; `notify-parent.yml` fires a `submodule-bumped` event into stromy-org.
+1. Bump `[project].version` in `pyproject.toml` (and `__version__`, and `uv lock`) through a reviewed PR.
+2. Run the Release workflow (`gh workflow run release.yml`). It derives the tag from `pyproject.toml`; nobody types a tag.
 
 See `stromy-org/infra-docs/ai/internal-libs.md` for the full release pattern.
 
