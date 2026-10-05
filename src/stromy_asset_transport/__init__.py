@@ -47,6 +47,7 @@ from .delivery import (
     TargetNotAllowed,
     UnsafePath,
     WorkspaceStorageError,
+    cancel_upload_session,
     create_file_once,
     deliver,
     deliver_artifact,
@@ -57,6 +58,7 @@ from .delivery import (
     list_file_versions,
     push_to_url,
     read_file,
+    validate_upload_target,
 )
 from .exceptions import DependencyError, StromyAssetTransportError
 from .keys import tenant_key
@@ -68,7 +70,7 @@ from .publication import (
 )
 from .store import ASSET_CLASSES, AssetStore, AssetStoreError
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "ASSET_CLASSES",
@@ -95,6 +97,7 @@ __all__ = [
     "TargetNotAllowed",
     "UnsafePath",
     "WorkspaceStorageError",
+    "cancel_upload_session",
     "create_file_once",
     "deliver",
     "deliver_artifact",
@@ -110,5 +113,6 @@ __all__ = [
     "push_to_url",
     "read_file",
     "tenant_key",
+    "validate_upload_target",
     "__version__",
 ]
