@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stromy-asset-transport"
-version = "0.9.0"
+version = "0.9.1"
 description = "Domain-agnostic content-addressed asset store and outbound delivery ladder shared by Stromy MCP servers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,6 +51,8 @@ packages = ["src/stromy_asset_transport"]
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+# Vendored byte for byte from the control plane; tested and linted at its owner.
+extend-exclude = ["scripts/ci/**", "scripts/ci_trigger_paths.py"]
 
 [tool.ruff.lint]
 select = ["ASYNC", "B", "PERF", "S", "E", "F", "W", "I"]
