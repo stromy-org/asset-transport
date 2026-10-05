@@ -1,0 +1,20 @@
+version: 1
+suites:
+  - id: unit
+    owner: stromy-org/asset-transport
+    tier: deterministic
+    surface: pr
+    paths: [tests/unit/**]
+    source_inputs: [src/**, pyproject.toml, uv.lock]
+    required: true
+    minimum_executed: 173
+    execution_step: tests
+  - id: contract
+    owner: stromy-org/asset-transport
+    tier: deterministic
+    surface: pr
+    paths: [tests/contract/**]
+    source_inputs: [src/**, pyproject.toml, uv.lock]
+    required: true
+    minimum_executed: 11
+    execution_step: contract
