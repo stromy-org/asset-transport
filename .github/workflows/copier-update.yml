@@ -42,7 +42,7 @@ jobs:
       - name: Generate stromy-ci App token
         id: app-token
         if: ${{ env.CI_APP_ID != '' }}
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.CI_APP_ID }}
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
@@ -57,7 +57,7 @@ jobs:
             python-library-template
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           token: ${{ steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
@@ -94,7 +94,7 @@ jobs:
 
       - name: Install uv
         if: steps.gate.outputs.ok == 'true'
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
 
       # Fix (a): python-library-template is a PRIVATE repo. `copier update`
       # shells out to `git clone` under the hood using the plain HTTPS URL
@@ -144,7 +144,7 @@ jobs:
 
       - name: Open update PR (never auto-merge)
         if: steps.gate.outputs.ok == 'true' && steps.update.outputs.changed == 'true' && steps.update.outputs.conflict == 'false'
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ steps.app-token.outputs.token || github.token }}
           branch: chore/copier-update
