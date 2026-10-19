@@ -7,7 +7,7 @@ suites:
     paths: [tests/unit/**]
     source_inputs: [src/**, pyproject.toml, uv.lock]
     required: true
-    minimum_executed: 173
+    minimum_executed: 176
     execution_step: tests
   - id: contract
     owner: stromy-org/asset-transport
