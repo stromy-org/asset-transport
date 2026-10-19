@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -103,7 +104,56 @@ def source(root, name):
     return yaml.load(path.read_text(), Loader=UniqueLoader)
 
 
-def z_finding(root, item):
+def ref_free(node):
+    """Drop remote `uses:` refs so an action bump does not re-key unrelated holds.
+
+    The action identity stays; only `@<ref>` goes. Local and docker refs are kept.
+    """
+    if isinstance(node, dict):
+        return {key: (value.rsplit('@', 1)[0] if key == 'uses' and isinstance(value, str)
+                      and '@' in value and not value.startswith(('./', 'docker://'))
+                      else ref_free(value)) for key, value in node.items()}
+    if isinstance(node, list):
+        return [ref_free(child) for child in node]
+    return node
+
+
+#: Audits whose subject is the pinned ref or its version comment, so a bump is a
+#: new review. Every other audit judges the step, trigger or permissions, and its
+#: hold survives a Dependabot bump. Re-classify when VERSIONS['zizmor'] moves.
+REF_JUDGING_RULES = frozenset({
+    'unpinned-uses', 'impostor-commit', 'ref-confusion', 'known-vulnerable-actions',
+    'stale-action-refs', 'ref-version-mismatch', 'forbidden-uses', 'unpinned-images'})
+USES_LINE = re.compile(r'''(?m)^(\s*(?:-\s+)?uses:\s*['"]?)([^\s'"#]+?)@[^\s'"#]+(['"]?)[ \t]*(?:#[^\n]*)?$''')
+
+
+def ref_free_text(text):
+    """Drop `@<ref>` and its `# version` comment from quoted `uses:` source lines."""
+    def strip(match):
+        if match.group(2).startswith(('./', 'docker://')):
+            return match.group(0)
+        return match.group(1) + match.group(2) + match.group(3)
+    return USES_LINE.sub(strip, text)
+
+
+def step_identity(siblings, index):
+    """A list item's stable key: its unique step `id`, else its unique `name`.
+
+    Keying by position re-keyed every hold below an inserted step (2026-10-14:
+    eight satellites re-keyed by hand after one template step was added). An
+    item with neither, or a name its siblings share, keeps its position.
+    """
+    item = siblings[index]
+    if isinstance(item, dict):
+        for field in ('id', 'name'):
+            value = item.get(field)
+            if isinstance(value, str) and value and sum(
+                    isinstance(other, dict) and other.get(field) == value for other in siblings) == 1:
+                return {'Step': {field: value}}
+    return None
+
+
+def z_finding(root, item, *, legacy=None):
     if not isinstance(item, dict) or item.get('ignored') is not False:
         raise ValueError('zizmor finding unavailable or ignored')
     locs = item['locations']
@@ -114,23 +164,42 @@ def z_finding(root, item):
     route = primary['route']['route']
     value = source(root, name)
     enclosing_step = None
+    stable = []
     for part in route:
         if set(part) == {'Key'}:
             key = part['Key']
             # PyYAML's YAML 1.1 loader represents the Actions `on` key as True.
             value = value[key if key in value else True if key == 'on' else key]
+            stable.append(part)
         elif set(part) == {'Index'} and type(part['Index']) is int:
+            stable.append(step_identity(value, part['Index']) or part)
             value = value[part['Index']]
             enclosing_step = value
         else:
             raise ValueError('unknown zizmor route component')
-    return {'tool': 'zizmor', 'rule': item['ident'], 'path': name,
-            'route': route, 'severity': item['determinations']['severity'],
-            'fragment_sha256': digest(enclosing_step if enclosing_step is not None else value),
-            'diagnostic_sha256': digest([(loc['symbolic']['annotation'], loc['concrete']['feature']) for loc in locs])}
+    fragment = enclosing_step if enclosing_step is not None else value
+    raw_diagnostic = [(loc['symbolic']['annotation'], loc['concrete']['feature']) for loc in locs]
+    # A ref-judging audit is re-reviewed on every bump. Any other audit judges the
+    # step, trigger or permissions, so its fragment AND the source text zizmor
+    # quotes for each location (secondary ones included) drop `uses:` refs.
+    judges_ref = item['ident'] in REF_JUDGING_RULES
+    finding = {'tool': 'zizmor', 'rule': item['ident'], 'path': name,
+               'route': stable, 'severity': item['determinations']['severity'],
+               'fragment_sha256': digest(fragment if judges_ref else ref_free(fragment)),
+               'diagnostic_sha256': digest(raw_diagnostic if judges_ref else
+                                           [(note, ref_free_text(text)) for note, text in raw_diagnostic])}
+    if legacy is not None:
+        # Holds keyed by an earlier scheme still match until re-keyed: positional
+        # routes, ref-bearing fragments, and ref-bearing quoted source.
+        on_uses = bool(route) and route[-1] == {'Key': 'uses'}
+        raw = {**finding, 'diagnostic_sha256': digest(raw_diagnostic), 'fragment_sha256': digest(fragment)}
+        located = {**raw, 'fragment_sha256': digest(fragment if on_uses else ref_free(fragment))}
+        forms = [digest({**form, 'route': each}) for form in (located, raw) for each in (stable, route)]
+        legacy[digest(finding)] = [form for form in dict.fromkeys(forms) if form != digest(finding)]
+    return finding
 
 
-def a_finding(root, item):
+def a_finding(root, item, *, legacy=None):
     if item['kind'] != 'shellcheck':
         # Native syntax, expression and actionlint semantic errors have no holds.
         raise ValueError('unwaivable actionlint finding: ' + item['message'])
@@ -140,29 +209,35 @@ def a_finding(root, item):
     document = yaml.compose(path.read_text())
     matches = []
 
-    def visit(node, route=()):
+    def visit(node, route=(), stable=()):
         if isinstance(node, yaml.MappingNode):
             if any(key.value == 'run' and key.start_mark.line == item['line'] - 1 for key, _ in node.value):
-                matches.append((route, yaml.serialize(node)))
+                matches.append((route, stable, yaml.serialize(node)))
             for key, value in node.value:
-                visit(value, route + (key.value,))
+                visit(value, route + (key.value,), stable + (key.value,))
         elif isinstance(node, yaml.SequenceNode):
+            siblings = [{key.value: value.value for key, value in child.value
+                         if isinstance(value, yaml.ScalarNode) and key.value in {'id', 'name'}}
+                        if isinstance(child, yaml.MappingNode) else None for child in node.value]
             for index, value in enumerate(node.value):
-                visit(value, route + (index,))
+                visit(value, route + (index,), stable + (step_identity(siblings, index) or index,))
 
     visit(document)
     if len(matches) != 1:
         raise ValueError('ambiguous actionlint step location')
-    route, text = matches[0]
+    route, stable, text = matches[0]
     code = re.search(r'\bSC\d+\b', item['message'])
     if code is None:
         raise ValueError('shellcheck rule unavailable')
-    return {'tool': 'actionlint', 'rule': code.group(), 'path': name,
-            'route': list(route), 'severity': 'reported',
-            'fragment_sha256': digest(text), 'diagnostic_sha256': digest(item['message'])}
+    finding = {'tool': 'actionlint', 'rule': code.group(), 'path': name,
+               'route': list(stable), 'severity': 'reported',
+               'fragment_sha256': digest(text), 'diagnostic_sha256': digest(item['message'])}
+    if legacy is not None and list(route) != list(stable):
+        legacy[digest(finding)] = [digest({**finding, 'route': list(route)})]
+    return finding
 
 
-def assess(findings, baseline, *, now=None):
+def assess(findings, baseline, *, now=None, aliases=None):
     now = now or datetime.now(UTC)
     if (not isinstance(baseline, dict) or set(baseline) != {'schema_version', 'versions', 'holds'}
             or baseline['schema_version'] != 1 or baseline['versions'] != VERSIONS
@@ -188,9 +263,31 @@ def assess(findings, baseline, *, now=None):
         if key in expected:
             raise ValueError('duplicate lint hold')
         expected[key] = hold['count']
-    observed = Counter(digest(finding) for finding in findings)
-    return {'new': sum((observed - expected).values()),
-            'stale': sum((expected - observed).values()), 'held': sum((observed & expected).values())}
+    remaining, new, held = Counter(expected), 0, 0
+    for finding in findings:
+        key = digest(finding)
+        for candidate in (key, *(aliases or {}).get(key, ())):
+            if candidate is not None and remaining[candidate] > 0:
+                remaining[candidate] -= 1
+                held += 1
+                break
+        else:
+            new += 1
+    return {'new': new, 'stale': sum(remaining.values()), 'held': held}
+
+
+def rekey(findings, baseline, aliases):
+    """Rewrite holds still keyed by a legacy form (position-keyed route,
+    ref-bearing fragment or ref-bearing quoted source); nothing else changes."""
+    current = {old: finding for finding in findings
+               for old in aliases.get(digest(finding), ()) if old != digest(finding)}
+    changed = 0
+    for hold in baseline['holds']:
+        replacement = current.get(digest(hold['finding']))
+        if replacement is not None:
+            hold['finding'] = dict(sorted(copy.deepcopy(replacement).items()))
+            changed += 1
+    return changed
 
 
 def run(command, *, root, seconds=60):
@@ -209,6 +306,8 @@ def main(argv=None):
     modes.add_argument('--emit-template', type=Path, help='emit the immutable three-file public lint bundle')
     modes.add_argument('--check-template', type=Path, help='compare a bundle with canonical committed source')
     parser.add_argument('--source-sha', help='full canonical commit for --emit-template')
+    parser.add_argument('--rekey-baseline', action='store_true',
+                        help='rewrite holds keyed by a legacy form (step position, ref-bearing fragment), then assess')
     args = parser.parse_args(argv)
     result = {'status': 'NOT-RUN', 'coverage': 'offline-native-workflows-and-actions', 'reason': '', 'findings': []}
     try:
@@ -223,6 +322,12 @@ def main(argv=None):
         if (local_bundle / BUNDLE_MANIFEST).exists():
             check_bundle(local_bundle)
         workflows = sorted(args.root.glob('.github/workflows/*.y*ml'))
+        if args.source_sha:
+            proof = run(['git', 'rev-parse', 'HEAD'], root=args.root, seconds=10)
+            if (not re.fullmatch(r'[0-9a-f]{40}', args.source_sha)
+                    or proof.returncode or proof.stdout.strip() != args.source_sha):
+                raise ValueError('native lint source differs from reviewed commit')
+            result['source_sha'] = args.source_sha
         actions = sorted(args.root.glob('.github/actions/**/action.y*ml'))
         if not workflows:
             raise ValueError('no native workflows; render before linting')
@@ -240,11 +345,18 @@ def main(argv=None):
         a_items, z_items = json.loads(a.stdout), json.loads(z.stdout)
         if not isinstance(a_items, list) or not isinstance(z_items, list):
             raise TypeError('lint output shape unavailable')
-        findings = [a_finding(args.root, item) for item in a_items] + [z_finding(args.root, item) for item in z_items]
+        aliases = {}
+        findings = ([a_finding(args.root, item, legacy=aliases) for item in a_items]
+                    + [z_finding(args.root, item, legacy=aliases) for item in z_items])
         if a.returncode == 1 and not a_items or z.returncode != 0 and not z_items:
             raise ValueError('failed lint tool supplied no findings')
         baseline = args.baseline or args.root / 'scripts/ci/workflow-lint-baseline.json'
-        counts = assess(findings, json.loads(baseline.read_text()))
+        data = json.loads(baseline.read_text())
+        if args.rekey_baseline:
+            assess(findings, data, aliases=aliases)  # validate before writing
+            result['rekeyed'] = rekey(findings, data, aliases)
+            baseline.write_text(json.dumps(data, indent=2) + '\n')
+        counts = assess(findings, data, aliases=aliases)
         result.update(status='FINDING' if counts['new'] or counts['stale'] else 'PASS', findings=findings, counts=counts, files=len(files))
         if result['status'] == 'FINDING':
             print('Lint findings changed; review the exact holds and native source.')

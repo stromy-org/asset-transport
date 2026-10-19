@@ -28,6 +28,14 @@ on:
   pull_request:
     branches: [main]
 
+
+# The shared adapter inherits ci-python's caller-scoped group; the generated
+# one runs its checks inline, so it cancels superseded PR runs itself and
+# never cancels a default-branch run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
 
   python-ci:
@@ -63,5 +71,17 @@ jobs:
           if [ -f .github/test-contract.yml ]; then
             uv run --no-project --python 3.12 --with pyyaml --with jsonschema python scripts/ci/suite_execution.py --step contract --report .contract-junit.xml --returncode 0
           fi
+      - name: Integration tests
+        # Every library ships tests/integration. A repo that grows tests there
+        # (a real PostgreSQL through testcontainers, say) runs them here, so an
+        # update to this file never leaves them with nowhere to run. An empty
+        # directory is reported, not collected.
+        run: |
+          if ! find tests/integration -name 'test_*.py' -print -quit 2>/dev/null | grep -q .; then
+            echo "tests/integration holds no tests; nothing to run."
+            exit 0
+          fi
+          uv run pytest tests/integration
       - run: uv lock --check
       - run: uv build
+
