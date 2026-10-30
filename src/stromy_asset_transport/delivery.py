@@ -261,6 +261,15 @@ class StaleBaseConflict:
         }
 
 
+#: Sharing-link scopes deliver_to_sharepoint may request (Graph createLink). The
+#: default is "organization"; "anonymous" is the accepted legacy shape (infra-docs
+#: security exception EX-002); "users" is a specific-people link. Anything else
+#: mints no link.
+SHARE_LINK_SCOPES: tuple[str, ...] = ("organization", "anonymous", "users")
+#: Deliveries are read-only: the link type is always "view", never "edit".
+SHARE_LINK_TYPE = "view"
+
+
 @dataclass
 class DeliveryResult:
     """How a delivered artifact left the server.
@@ -280,6 +289,10 @@ class DeliveryResult:
     web_url: str | None = None
     destination_url: str | None = None
     destination_item_id: str | None = None
+    #: The sharing link actually issued for a SharePoint delivery ("organization",
+    #: "anonymous", "users"), or None when no link was minted and `web_url` only
+    #: opens for people who already have access (ORG-PLAN-500 C8).
+    link_scope: str | None = None
     delivered_via: str | None = None
     failure_code: str | None = None
     retryable: bool = False
@@ -489,6 +502,7 @@ def deliver_artifact(
                 web_url=_as_str(sp.get("web_url")),
                 destination_url=_as_str(sp.get("drive_item_web_url")),
                 destination_item_id=_as_str(sp.get("item_id")),
+                link_scope=_as_str(sp.get("link_scope")),
                 delivered_via=_as_str(sp.get("delivered_via")),
                 failure_code=guard_failure,
                 replaced_etag=_as_str(sp.get("replaced_etag")),
@@ -1236,7 +1250,8 @@ def deliver_to_sharepoint(
       RENDER_SHAREPOINT_SITE_ID    -> resolve the site's default drive, then upload
     Optional:
       RENDER_SHAREPOINT_BASE_PATH  -> root folder under the drive (default 'Deliverables')
-      RENDER_SHAREPOINT_LINK_SCOPE -> sharing-link scope: 'organization' (default) | 'anonymous'
+      RENDER_SHAREPOINT_LINK_SCOPE -> sharing-link scope: 'organization' (default) | 'anonymous' | 'users';
+                                      any other value mints no link (fail closed, noted)
       RENDER_SHAREPOINT_ALLOWED_SITES -> comma-separated sites an explicit ``target`` may name
 
     ``target`` (:class:`SharePointTarget`) overrides the env destination for this
@@ -1368,16 +1383,28 @@ def deliver_to_sharepoint(
     # a failed link mint still returns the (org-internal) webUrl rather than nothing.
     # `webUrl` mode opts out entirely: the readers are members of the target site,
     # so the item's own URL resolves for them and no link needs minting.
+    #
+    # Link semantics are explicit and recorded (ORG-PLAN-500 C8): the scope comes
+    # from an allowlist, never a free string, and the result says which link was
+    # actually issued. An unknown scope mints NOTHING (fail closed, with a note):
+    # a typo must never reach Graph as a guess, and a failed mint never widens to
+    # an Anyone link.
     share_url = web_url
-    scope = os.environ.get("RENDER_SHAREPOINT_LINK_SCOPE") or "organization"
+    scope = (os.environ.get("RENDER_SHAREPOINT_LINK_SCOPE") or "organization").strip().lower()
     link_mode = target.link_mode if target is not None else "createLink"
-    if item_id and link_mode != "webUrl":
+    link_scope: str | None = None
+    if link_mode != "webUrl" and scope not in SHARE_LINK_SCOPES:
+        notes.append(
+            f"sharing link not minted: RENDER_SHAREPOINT_LINK_SCOPE={scope!r} is not one of "
+            f"{', '.join(SHARE_LINK_SCOPES)}; the returned URL opens only for people who already have access"
+        )
+    elif item_id and link_mode != "webUrl":
         try:
             link = _graph_request(
                 f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink",
                 token=token,
                 method="POST",
-                data=json.dumps({"type": "view", "scope": scope}).encode("utf-8"),
+                data=json.dumps({"type": SHARE_LINK_TYPE, "scope": scope}).encode("utf-8"),
                 content_type="application/json",
             )
             link_obj = link.get("link")
@@ -1386,14 +1413,22 @@ def deliver_to_sharepoint(
             )
             if link_web:
                 share_url = link_web
+                link_scope = scope
         except OutputStoreError:
             pass  # fall back to the bare driveItem webUrl
+        if link_scope is None:
+            notes.append(
+                "sharing link could not be minted; the returned URL opens only for "
+                "people who already have access to the item"
+            )
 
     return {
         "delivered_via": "sharepoint-server",
         "web_url": share_url,
         "drive_item_web_url": web_url,
         "item_id": item_id,
+        "link_scope": link_scope,
+        "link_type": SHARE_LINK_TYPE if link_scope else None,
         "replaced_etag": replaced.get("etag"),
         "replaced_last_modified_at": replaced.get("last_modified_at"),
         "replaced_existing": replaced.get("existed"),
