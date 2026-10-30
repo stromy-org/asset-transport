@@ -237,6 +237,80 @@ def test_sharepoint_falls_back_to_item_weburl_when_link_mint_fails(monkeypatch):
     assert res["web_url"] == "https://stromy.sharepoint.com/item-1"
 
 
+# --- link semantics (ORG-PLAN-500 C8): explicit, allowlisted, recorded --------- #
+
+
+def _sp_env(monkeypatch, scope: str | None) -> list[dict]:
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    if scope is None:
+        monkeypatch.delenv("RENDER_SHAREPOINT_LINK_SCOPE", raising=False)
+    else:
+        monkeypatch.setenv("RENDER_SHAREPOINT_LINK_SCOPE", scope)
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    calls: list[dict] = []
+    monkeypatch.setattr(O, "_graph_request", _fake_graph(calls))
+    return calls
+
+
+def _link_bodies(calls: list[dict]) -> list[dict]:
+    return [json.loads(c["data"]) for c in calls if c["method"] == "POST" and c["url"].endswith("/createLink")]
+
+
+def test_sharepoint_link_defaults_to_organization_view_and_records_it(monkeypatch):
+    calls = _sp_env(monkeypatch, None)
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert res is not None
+    assert _link_bodies(calls) == [{"type": "view", "scope": "organization"}]
+    assert res["link_scope"] == "organization"
+    assert res["link_type"] == "view"
+
+
+@pytest.mark.parametrize("scope", ["anonymous", "users", " Anonymous "])
+def test_sharepoint_link_scope_follows_the_allowlisted_env(monkeypatch, scope):
+    calls = _sp_env(monkeypatch, scope)
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert res is not None
+    want = scope.strip().lower()
+    assert _link_bodies(calls) == [{"type": "view", "scope": want}]
+    assert res["link_scope"] == want
+
+
+@pytest.mark.parametrize("scope", ["anyone", "public", "edit", "organisation"])
+def test_sharepoint_unknown_scope_mints_nothing_and_says_so(monkeypatch, scope):
+    calls = _sp_env(monkeypatch, scope)
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert res is not None
+    assert _link_bodies(calls) == []
+    assert res["link_scope"] is None and res["link_type"] is None
+    assert res["web_url"] == "https://stromy.sharepoint.com/item-1"
+    assert any("not minted" in n for n in res["notes"])
+
+
+def test_sharepoint_failed_mint_never_widens_and_is_noted(monkeypatch):
+    monkeypatch.setenv("RENDER_SHAREPOINT_DRIVE_ID", "drive-xyz")
+    monkeypatch.delenv("RENDER_SHAREPOINT_SITE_ID", raising=False)
+    monkeypatch.setenv("RENDER_SHAREPOINT_LINK_SCOPE", "users")
+    monkeypatch.setattr(O, "_graph_token", lambda: "fake-token")
+    bodies: list[dict] = []
+
+    def _impl(url, *, token, method="GET", data=None, content_type=None):
+        if method == "PUT":
+            return {"id": "item-1", "webUrl": "https://stromy.sharepoint.com/item-1"}
+        if method == "POST":
+            bodies.append(json.loads(data))
+            raise O.OutputStoreError("createLink denied")
+        return {}
+
+    monkeypatch.setattr(O, "_graph_request", _impl)
+    res = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert res is not None
+    # One attempt, at the requested scope; no retry at a wider one.
+    assert bodies == [{"type": "view", "scope": "users"}]
+    assert res["link_scope"] is None
+    assert any("could not be minted" in n for n in res["notes"])
+
+
 def _http_error(status: int, body: dict[str, object]) -> urllib_error.HTTPError:
     return urllib_error.HTTPError(
         "https://graph.microsoft.com/upload",
