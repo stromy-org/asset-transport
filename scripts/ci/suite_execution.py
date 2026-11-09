@@ -28,6 +28,9 @@ PORTABLE_FILES = (
 NATIVE_READER = 'scripts/ci/native_suite.py'
 INPUT_REUSE_FILES = ('scripts/ci/input_fingerprint.py', 'scripts/ci/dedup_evidence.py',
                      '.github/actions/ci-dedup/action.yml')
+# Binds a `--emit-units` bundle to unit records; it imports input_fingerprint,
+# so it only ships on top of the input-reuse profile (ORG-PLAN-505 C2).
+UNIT_REUSE_FILES = ('scripts/ci/reuse.py',)
 LEGACY_NATIVE_MANIFEST = 'scripts/ci/native-suite-bundle.json'
 LEGACY_NATIVE_FILES = ('native_suite.py', 'suite_evidence.py', 'workflow_identity.py',
                        'execution_contract.py', 'test-contract.schema.json')
@@ -45,6 +48,7 @@ CI_INPUTS = (
     "scripts/ci/input_fingerprint.py",
     "scripts/ci/dedup_evidence.py",
     ".github/actions/ci-dedup/action.yml",
+    "scripts/ci/reuse.py",
     "scripts/ci/workflow_identity.py",
     "scripts/ci/execution_contract.py",
     "scripts/ci/test-contract.schema.json",
@@ -55,6 +59,7 @@ NATIVE_MANIFEST = '.github/owning-suite-bundle.json'
 NATIVE_BUNDLE_VERSION = 1
 NATIVE_READER_BUNDLE_VERSION = 1
 INPUT_REUSE_BUNDLE_VERSION = 1
+UNIT_REUSE_BUNDLE_VERSION = 1
 
 
 def canonical_git(root, sha):
@@ -73,15 +78,27 @@ def canonical_git(root, sha):
     return git
 
 
-def native_names(*, include_reader=False, include_input_reuse=False):
+def native_names(*, include_reader=False, include_input_reuse=False, include_unit_reuse=False):
+    if include_unit_reuse and not include_input_reuse:
+        raise ValueError('unit reuse requires the input-reuse profile it imports')
     return (*PORTABLE_FILES, *((NATIVE_READER,) if include_reader else ()),
-            *(INPUT_REUSE_FILES if include_input_reuse else ()))
+            *(INPUT_REUSE_FILES if include_input_reuse else ()),
+            *(UNIT_REUSE_FILES if include_unit_reuse else ()))
 
 
-def canonical_files(root, sha, *, include_reader=False, include_input_reuse=False):
+def seal_profiles():
+    """Every file set a valid owning-suite seal may name."""
+    return [set(native_names(include_reader=reader, include_input_reuse=reuse, include_unit_reuse=units))
+            for reader in (False, True) for reuse in (False, True) for units in (False, True)
+            if reuse or not units]
+
+
+def canonical_files(root, sha, *, include_reader=False, include_input_reuse=False,
+                    include_unit_reuse=False):
     """Export committed owner bytes only after they are published on main."""
     git = canonical_git(root, sha)
-    names = native_names(include_reader=include_reader, include_input_reuse=include_input_reuse)
+    names = native_names(include_reader=include_reader, include_input_reuse=include_input_reuse,
+                         include_unit_reuse=include_unit_reuse)
     files = {name: git('show', sha + ':' + name) for name in names}
     if any(not body or len(body) > 512_000 for body in files.values()):
         raise ValueError('canonical owning-suite file unavailable or over bound')
@@ -101,6 +118,11 @@ def canonical_files(root, sha, *, include_reader=False, include_input_reuse=Fals
                and any(isinstance(target, ast.Name) and target.id == 'INPUT_REUSE_BUNDLE_VERSION'
                        for target in node.targets) for node in module.body):
         raise ValueError('canonical source predates the input-reuse bundle protocol')
+    if include_unit_reuse and not any(isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+               and node.value.value == UNIT_REUSE_BUNDLE_VERSION
+               and any(isinstance(target, ast.Name) and target.id == 'UNIT_REUSE_BUNDLE_VERSION'
+                       for target in node.targets) for node in module.body):
+        raise ValueError('canonical source predates the unit-reuse bundle protocol')
     return files
 
 
@@ -167,7 +189,7 @@ def legacy_floor_bundle(repo, root, names, source_sha):
 
 
 def native_bundle(repo, *, emit=False, source_sha=None, root=None, include_reader=False,
-                  legacy_source_sha=None, include_input_reuse=False):
+                  legacy_source_sha=None, include_input_reuse=False, include_unit_reuse=False):
     """One canonical export for consumer-owned CI, plus a portable drift seal."""
     root = root or Path(__file__).resolve().parents[2]
     repo = repo.resolve()
@@ -182,7 +204,9 @@ def native_bundle(repo, *, emit=False, source_sha=None, root=None, include_reade
             previous = native_bundle(repo)  # Never overwrite locally modified vendor files.
             include_reader |= NATIVE_READER in previous['files']
             include_input_reuse |= all(name in previous['files'] for name in INPUT_REUSE_FILES)
-            additions = set(native_names(include_reader=include_reader, include_input_reuse=include_input_reuse)) - set(previous['files'])
+            include_unit_reuse |= all(name in previous['files'] for name in UNIT_REUSE_FILES)
+            additions = set(native_names(include_reader=include_reader, include_input_reuse=include_input_reuse,
+                                         include_unit_reuse=include_unit_reuse)) - set(previous['files'])
             for name in additions:
                 if (repo / name).exists() or (repo / name).is_symlink():
                     git = canonical_git(root, previous['source_sha'])
@@ -190,7 +214,8 @@ def native_bundle(repo, *, emit=False, source_sha=None, root=None, include_reade
                             'show', previous['source_sha'] + ':' + name):
                         raise ValueError('unsealed native helper differs from the previous canonical source')
         files = canonical_files(root, source_sha, include_reader=include_reader,
-                                include_input_reuse=include_input_reuse)
+                                include_input_reuse=include_input_reuse,
+                                include_unit_reuse=include_unit_reuse)
         old_manifest = repo / LEGACY_NATIVE_MANIFEST
         if not path.exists() and include_reader and (old_manifest.exists() or old_manifest.is_symlink()):
             legacy = legacy_native_bundle(repo, root, files, source_sha=legacy_source_sha)
@@ -208,16 +233,18 @@ def native_bundle(repo, *, emit=False, source_sha=None, root=None, include_reade
                 or type(value['schema_version']) is not int or value['schema_version'] != 1
                 or value['source_repo'] != 'stromy-org/stromy-org'
                 or not re.fullmatch(r'[a-f0-9]{40}', str(value['source_sha']))
-                or not isinstance(value['files'], dict) or set(value['files']) not in [
-                    set(native_names(include_reader=reader, include_input_reuse=reuse))
-                    for reader in (False, True) for reuse in (False, True)]):
+                or not isinstance(value['files'], dict) or set(value['files']) not in seal_profiles()):
             raise ValueError('owning-suite source seal identity differs')
         if include_reader and NATIVE_READER not in value['files']:
             raise ValueError('owning-suite seal has no native reader')
         if include_input_reuse and not all(name in value['files'] for name in INPUT_REUSE_FILES):
             raise ValueError('owning-suite seal has no input reuse helpers')
+        if include_unit_reuse and not all(name in value['files'] for name in UNIT_REUSE_FILES):
+            raise ValueError('owning-suite seal has no unit reuse helper')
         files = canonical_files(root, source_sha, include_reader=NATIVE_READER in value['files'],
-                                include_input_reuse=all(name in value['files'] for name in INPUT_REUSE_FILES)) if source_sha is not None else None
+                                include_input_reuse=all(name in value['files'] for name in INPUT_REUSE_FILES),
+                                include_unit_reuse=all(name in value['files'] for name in UNIT_REUSE_FILES)
+                                ) if source_sha is not None else None
         if source_sha is not None and source_sha != value['source_sha']:
             raise ValueError('owning-suite source differs from requested canonical revision')
     for name in value['files']:
@@ -322,7 +349,12 @@ def evaluate(repo: Path, step: str, report: Path, returncode: int,
 # suites makes the bundle incomplete, which carries no aggregate credit.
 
 UNIT_BUNDLE_SCHEMA = "ci-unit-bundle/1"
-_PYTEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$")
+#: Unit discovery per declared kind. A shell harness is one standalone script;
+#: its JUnit cases name it by repository path in `file` (or `classname`).
+UNIT_KINDS = {
+    "pytest-file": re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test)\.py$"),
+    "shell-harness": re.compile(r"(?:^|/)test[-_][^/]*\.(?:sh|bats)$"),
+}
 
 
 def tracked_files(repo: Path) -> list[str]:
@@ -348,6 +380,8 @@ def unit_bundle(repo: Path, suites: list[dict], report: Path, *, step: str, stat
               "reason": "" if declaring else "no selected suite declares units",
               "suites": {}, "inventory": inventory}
     try:
+        if not declaring:
+            raise ValueError(bundle["reason"])
         listing = tracked_files(repo) if files is None else sorted(files)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         listing, bundle["reason"] = None, str(exc)
@@ -363,16 +397,19 @@ def unit_bundle(repo: Path, suites: list[dict], report: Path, *, step: str, stat
         try:
             if listing is None:
                 raise ValueError("tracked file inventory unavailable")
-            units = [p for p in listing if _PYTEST_FILE.search(p)
+            kind = suite["units"]["kind"]
+            if kind not in UNIT_KINDS:
+                raise ValueError(f"unknown unit kind {kind!r}")
+            units = [p for p in listing if UNIT_KINDS[kind].search(p)
                      and any(ci_trigger_paths.matches(p, g) for g in suite["paths"])]
             if not units:
-                raise ValueError("no pytest-file unit matches the suite paths")
+                raise ValueError(f"no {kind} unit matches the suite paths")
             shared = sorted(set(units) & set(inventory["units"]))
             if shared:
                 raise ValueError(f"unit claimed by two suites: {shared[0]}")
             if not report.is_file():
                 raise ValueError("execution report unavailable")
-            row["units"] = unit_outcomes(report, units, scope=suite["paths"])
+            row["units"] = unit_outcomes(report, units, scope=suite["paths"], kind=kind)
         except (OSError, ValueError, ParseError) as exc:
             row["reason"] = str(exc)
             inventory["complete"] = False
@@ -382,6 +419,25 @@ def unit_bundle(repo: Path, suites: list[dict], report: Path, *, step: str, stat
             inventory["units"][unit] = {"suite": suite["id"], "applicable": True,
                                         "prerequisites": [], "cases": None}
     return bundle
+
+
+def emit_units(args, status):
+    """Write the unit bundle when a selected suite declares units; never the verdict.
+
+    No declaring suite writes nothing, so a consumer that has not opted in
+    uploads no artifact. An emission failure is reported and leaves the floor
+    verdict alone: the missing bundle is incomplete evidence, never a pass.
+    """
+    try:
+        suites = selected_suites(load_contract(args.repo), args.step,
+                                 surface=args.surface, suite_id=args.suite)
+        if not any(s.get("units") for s in suites):
+            return
+        bundle = unit_bundle(args.repo, suites, args.report, step=args.step, status=status)
+        args.emit_units.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_units.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n")
+    except (OSError, ValueError, ImportError, ParseError) as exc:
+        print(f"unit bundle not emitted: {exc}", file=sys.stderr)
 
 
 def main():
@@ -396,6 +452,8 @@ def main():
                         help='include the canonical native evidence reader for deploy guards')
     parser.add_argument('--include-input-reuse', action='store_true',
                         help='include canonical portable input fingerprints and the reuse action')
+    parser.add_argument('--include-unit-reuse', action='store_true',
+                        help='also include the unit bundle binder (scripts/ci/reuse.py); needs input reuse')
     parser.add_argument('--legacy-source-sha',
                         help='published main snapshot proving the legacy reader or four-file floor profile')
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -412,10 +470,12 @@ def main():
             value = native_bundle(args.emit_native or args.check_native, emit=bool(args.emit_native),
                                   source_sha=args.source_sha, include_reader=args.include_native_reader,
                                   legacy_source_sha=args.legacy_source_sha,
-                                  include_input_reuse=args.include_input_reuse)
+                                  include_input_reuse=args.include_input_reuse,
+                                  include_unit_reuse=args.include_unit_reuse)
             print(json.dumps({'source_sha': value['source_sha'], 'files': len(value['files']), 'status': 'pass'}))
             return 0
-        if args.include_native_reader or args.legacy_source_sha or args.include_input_reuse:
+        if (args.include_native_reader or args.legacy_source_sha or args.include_input_reuse
+                or args.include_unit_reuse):
             parser.error('reader options require a native bundle operation')
         if args.emit_template or args.check_template:
             return template_copy(
@@ -427,11 +487,7 @@ def main():
         result = evaluate(args.repo, args.step, args.report, args.returncode,
                           surface=args.surface, suite_id=args.suite)
         if args.emit_units:
-            suites = selected_suites(load_contract(args.repo), args.step,
-                                     surface=args.surface, suite_id=args.suite)
-            bundle = unit_bundle(args.repo, suites, args.report, step=args.step,
-                                 status=result["status"])
-            args.emit_units.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n")
+            emit_units(args, result["status"])
         print(json.dumps(result, sort_keys=True), file=sys.stderr)
         print(result["status"])
         return int(result["status"] == "fail")

@@ -299,8 +299,22 @@ def _case_paths(owner):
     return ["/".join(parts[:end]) + ".py" for end in range(1, len(parts) + 1)]
 
 
-def unit_outcomes(report, units, *, scope=None):
-    """Per-unit outcome and case states from one pytest JUnit report (ORG-PLAN-505 C2).
+def _harness_owner(case):
+    """The repository path a shell-harness case names: its `file`, else its classname.
+
+    Same spellings the floor counter (`execution_contract.junit_counts`)
+    accepts; an absolute path matches no unit, so that harness stays blocked.
+    """
+    return (case.get("file") or case.get("classname") or "").removeprefix("./")
+
+
+def unit_outcomes(report, units, *, scope=None, kind="pytest-file"):
+    """Per-unit outcome and case states from one JUnit report (ORG-PLAN-505 C2).
+
+    `kind` "pytest-file" maps a case to a unit through pytest's dotted
+    classname; "shell-harness" requires the case to name the harness script by
+    its exact repository path (`file` or `classname`), so a renamed or
+    unreported harness is never matched by a guess.
 
     `units` is the CURRENT expected inventory of pytest-file units. A unit with
     no case in the report was not reached (fail-fast, a crash, a cancelled job)
@@ -315,9 +329,12 @@ def unit_outcomes(report, units, *, scope=None):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         import ci_trigger_paths
         scope = list(scope)
+    if kind not in {"pytest-file", "shell-harness"}:
+        raise ValueError(f"unknown unit kind {kind!r}")
+    harness = kind == "shell-harness"
     modules = {}
     for unit in units:
-        module = _unit_module(unit)
+        module = unit if harness else _unit_module(unit)
         if module is None:
             raise ValueError(f"unit {unit!r} is not a pytest file unit")
         modules[module] = unit
@@ -331,11 +348,13 @@ def unit_outcomes(report, units, *, scope=None):
     for case in tree.iter("testcase"):
         classname, name = case.get("classname") or "", case.get("name") or ""
         # A collection error has an empty classname and the module as its name.
-        owner = classname or name
-        matches = [m for m in modules if owner == m or owner.startswith(m + ".")]
+        owner = _harness_owner(case) if harness else classname or name
+        matches = ([m for m in modules if owner == m] if harness
+                   else [m for m in modules if owner == m or owner.startswith(m + ".")])
         if not name or not matches:
+            paths = [owner] if harness else _case_paths(owner)
             if scope is not None and name and not any(
-                    ci_trigger_paths.matches(path, glob) for path in _case_paths(owner) for glob in scope):
+                    ci_trigger_paths.matches(path, glob) for path in paths for glob in scope):
                 continue
             raise ValueError("report case outside the current unit inventory")
         unit = modules[max(matches, key=len)]
