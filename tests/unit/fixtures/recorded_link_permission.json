@@ -1,0 +1,11 @@
+{
+  "_provenance": "Graph permission shape recorded 2026-11-05. Opaque id, sharing URL and identity values sanitized; roles and link scope/type preserved.",
+  "id": "recorded-permission",
+  "roles": ["read"],
+  "shareId": "REDACTED",
+  "hasPassword": false,
+  "grantedToIdentitiesV2": [
+    {"user": {"displayName": "Operator", "email": "operator@example.invalid", "id": "redacted-user"}}
+  ],
+  "link": {"scope": "anonymous", "type": "view", "webUrl": "https://example.invalid/REDACTED", "preventsDownload": false}
+}

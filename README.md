@@ -52,6 +52,22 @@ do not need it. See `stromy-org/infra-docs/ai/asset-store.md` for the full model
 
 ### Per-space SharePoint targeting
 
+Every minted sharing link gets one independent permission readback (10-second
+timeout). `DeliveryResult.link_scope` records the observed scope;
+`link_scope_check` carries `matched`, `mismatch` or `not-run`, the observed link
+type and a sanitized reason. A match proves only that this permission has the
+configured scope and read-only rights. Anonymous and organization links do not
+prove recipient identity authorization. Specific-people links require
+`SharePointTarget.intended_recipients` (emails or object IDs) to verify their
+nonempty grantee set; this field never grants or invites anyone.
+
+A mismatch or unreadable permission is visible in `warnings`; delivery returns
+the item's existing-access URL rather than an unverified sharing URL. The file
+and minted permission remain intact, no wider-scope retry is made, and no link
+is revoked. `link_mode="webUrl"` mints nothing and adds no permission read.
+No sharing default changes in this release. Consumers should preserve the
+receipt and warnings in their delivery results.
+
 The `RENDER_SHAREPOINT_*` env vars name **one** deployment-wide destination. To
 deliver into a per-engagement collaboration space instead, pass an explicit
 `SharePointTarget`:

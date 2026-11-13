@@ -164,7 +164,9 @@ def _no_preexisting_item_by_default(request, monkeypatch):
 
 
 def _fake_graph(calls: list[dict]):
-    def _impl(url, *, token, method="GET", data=None, content_type=None):
+    permission = {}
+
+    def _impl(url, *, token, method="GET", data=None, content_type=None, timeout=None):
         calls.append({"url": url, "method": method, "data": data})
         if method == "GET" and url.endswith("/drive"):
             return {"id": "resolved-drive-id"}
@@ -173,7 +175,11 @@ def _fake_graph(calls: list[dict]):
         if method == "PUT" and url.endswith(":/content"):
             return {"id": "item-1", "webUrl": "https://stromy.sharepoint.com/item-1"}
         if method == "POST" and url.endswith("/createLink"):
-            return {"link": {"webUrl": "https://stromy.sharepoint.com/share/abc"}}
+            permission.update({"id": "permission-1", "roles": ["read"],
+                               "link": {**json.loads(data), "webUrl": "https://stromy.sharepoint.com/share/abc"}})
+            return permission
+        if method == "GET" and url.endswith("/permissions/permission-1"):
+            return permission
         return {}
 
     return _impl
@@ -255,6 +261,110 @@ def _sp_env(monkeypatch, scope: str | None) -> list[dict]:
 
 def _link_bodies(calls: list[dict]) -> list[dict]:
     return [json.loads(c["data"]) for c in calls if c["method"] == "POST" and c["url"].endswith("/createLink")]
+
+
+def _scope_graph(monkeypatch, *, requested="organization", permission=None, unavailable=False):
+    """Replay the recorded permission after a successful createLink, without network."""
+    from pathlib import Path
+
+    recorded = json.loads((Path(__file__).parent / "fixtures/recorded_link_permission.json").read_text())
+    actual = recorded if permission is None else permission
+    calls = _sp_env(monkeypatch, requested)
+    original = _fake_graph(calls)
+
+    def graph(url, *, token, method="GET", data=None, content_type=None, timeout=None):
+        if method == "POST" and url.endswith("/createLink"):
+            calls.append({"url": url, "method": method, "data": data, "timeout": timeout})
+            return {"id": "recorded-permission", "link": {"webUrl": recorded["link"]["webUrl"]}}
+        if method == "GET" and "/permissions/" in url:
+            calls.append({"url": url, "method": method, "data": data, "timeout": timeout})
+            if unavailable:
+                raise O.OutputStoreError("permission read unavailable")
+            return actual
+        return original(url, token=token, method=method, data=data, content_type=content_type)
+
+    monkeypatch.setattr(O, "_graph_request", graph)
+    return calls, recorded
+
+
+def test_minted_link_is_checked_against_recorded_permission_not_requested_scope(monkeypatch):
+    calls, recorded = _scope_graph(monkeypatch)
+    result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert result is not None
+    # The real response was anonymous; claiming the requested organization scope is the defect.
+    assert result["link_scope"] == "anonymous"
+    assert result["link_scope_check"]["status"] == "mismatch"
+    assert result["web_url"] != recorded["link"]["webUrl"]
+    assert result["web_url"] == result["drive_item_web_url"]
+    assert len([c for c in calls if "/permissions/" in c["url"]]) == 1
+    assert next(c["timeout"] for c in calls if "/permissions/" in c["url"]) == 10
+    assert any("permission" in n and "mismatch" in n for n in result["notes"])
+    assert not any(c["method"] in ("PATCH", "DELETE") for c in calls)
+
+
+def test_configured_anonymous_default_is_checked_without_claiming_identity_authorization(monkeypatch):
+    calls, recorded = _scope_graph(monkeypatch, requested="anonymous")
+    result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert result is not None
+    assert result["web_url"] == recorded["link"]["webUrl"]
+    assert result["link_scope_check"]["status"] == "matched"
+    assert result["link_scope_check"]["identity_authorized"] is False
+    assert _link_bodies(calls) == [{"type": "view", "scope": "anonymous"}]
+    receipt = json.dumps(result["link_scope_check"])
+    assert "REDACTED" not in receipt and "operator@example.invalid" not in receipt
+
+
+@pytest.mark.parametrize("permission", [{}, {"id": "other"}, {"id": "recorded-permission", "link": None}])
+def test_missing_or_foreign_permission_is_not_a_verified_link(monkeypatch, permission):
+    _scope_graph(monkeypatch, permission=permission)
+    result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert result is not None
+    assert result["link_scope_check"]["status"] == "not-run"
+    assert result["web_url"] == result["drive_item_web_url"]
+
+
+def test_permission_outage_is_visible_and_does_not_retry_at_a_wider_scope(monkeypatch):
+    calls, _ = _scope_graph(monkeypatch, unavailable=True)
+    result = O.deliver_to_sharepoint(b"deck", filename="d.pptx")
+    assert result is not None
+    assert result["link_scope_check"]["status"] == "not-run"
+    assert _link_bodies(calls) == [{"type": "view", "scope": "organization"}]
+    assert result["web_url"] == result["drive_item_web_url"]
+
+
+@pytest.mark.parametrize("scope,kind,roles,status", [
+    ("organization", "view", ["read"], "matched"),
+    ("organization", "edit", ["write"], "mismatch"),
+    ("anonymous", "view", ["read"], "mismatch"),
+    ("unknown", "view", ["read"], "not-run"),
+    ("organization", "view", [], "not-run"),
+])
+def test_scope_classifier_requires_actual_known_view_permission(scope, kind, roles, status):
+    permission = {"id": "p", "roles": roles, "link": {"scope": scope, "type": kind}}
+    result = O.check_link_scope(permission, permission_id="p", expected_scope="organization")
+    assert result["status"] == status
+
+
+def test_specific_people_readback_checks_each_grantee_without_returning_identifiers():
+    permission = {"id": "p", "roles": ["read"], "link": {"scope": "users", "type": "view"},
+                  "grantedToIdentitiesV2": [{"user": {"email": "a@example.invalid"}}]}
+    def check(intended):
+        return O.check_link_scope(permission, permission_id="p", expected_scope="users", intended=intended)
+    assert check(())["status"] == "not-run"
+    assert check(("A@example.invalid",))["identity_authorized"] is True
+    permission["grantedToIdentitiesV2"].append({"user": {"email": "other@example.invalid"}})
+    assert check(("a@example.invalid",))["status"] == "mismatch"
+    assert "@example.invalid" not in json.dumps(check(("a@example.invalid",)))
+
+
+def test_delivery_ladder_preserves_scope_receipt_and_warning(monkeypatch):
+    _scope_graph(monkeypatch)
+    result = O.deliver_artifact(b"deck", filename="d.pptx", inline_max=0)
+    assert result.mode == "sharepoint"
+    assert result.link_scope == "anonymous"
+    assert result.link_scope_check["status"] == "mismatch"
+    assert result.web_url == result.destination_url
+    assert any("permission mismatch" in w for w in result.warnings)
 
 
 def test_sharepoint_link_defaults_to_organization_view_and_records_it(monkeypatch):
