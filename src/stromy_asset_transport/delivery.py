@@ -164,6 +164,9 @@ class SharePointTarget:
     drive_id: str | None = None
     base_path: str | None = None
     link_mode: str = "createLink"
+    #: Optional expected emails/object IDs for verifying a specific-people link.
+    #: This is readback context only: it never invites or grants a recipient.
+    intended_recipients: tuple[str, ...] = ()
 
 
 def _normalize_site_ref(ref: str) -> str:
@@ -327,6 +330,9 @@ class DeliveryResult:
     #: Carried into every fallback result so the caller never cancels twice.
     upload_session_status: str | None = None
     warnings: list[str] = field(default_factory=_empty_str_list)
+    #: Metadata-only verification of the minted permission, not an assertion
+    #: about the item's other access paths. None for non-minting channels.
+    link_scope_check: dict[str, object] | None = None
 
 
 def deliver_artifact(
@@ -503,6 +509,7 @@ def deliver_artifact(
                 destination_url=_as_str(sp.get("drive_item_web_url")),
                 destination_item_id=_as_str(sp.get("item_id")),
                 link_scope=_as_str(sp.get("link_scope")),
+                link_scope_check=cast("dict[str, object] | None", sp.get("link_scope_check")),
                 delivered_via=_as_str(sp.get("delivered_via")),
                 failure_code=guard_failure,
                 replaced_etag=_as_str(sp.get("replaced_etag")),
@@ -921,6 +928,7 @@ def _graph_call(
     data: bytes | None = None,
     content_type: str | None = None,
     if_match: str | None = None,
+    timeout: float | None = None,
 ) -> GraphResponse:
     """Issue one Graph request and return the full response, status included.
 
@@ -946,7 +954,9 @@ def _graph_call(
         headers["Content-Length"] = str(len(data))
     req = urllib_request.Request(url, data=data, headers=headers, method=method)  # noqa: S310
     try:
-        with urllib_request.urlopen(req) as resp:  # noqa: S310
+        response = (urllib_request.urlopen(req) if timeout is None  # noqa: S310
+                    else urllib_request.urlopen(req, timeout=timeout))  # noqa: S310
+        with response as resp:
             status = int(getattr(resp, "status", resp.getcode()) or 0)
             return GraphResponse(status=status, headers=dict(resp.headers.items()), body=resp.read())
     except urllib_error.HTTPError as exc:
@@ -965,6 +975,7 @@ def _graph_request(
     method: str = "GET",
     data: bytes | None = None,
     content_type: str | None = None,
+    timeout: float | None = None,
 ) -> dict[str, object]:
     """Issue one Graph request and return the parsed JSON body (``{}`` if empty).
 
@@ -973,7 +984,10 @@ def _graph_request(
     :class:`SharePointLockedError` and every other error status as
     :class:`GraphRequestError`, both carrying the machine-readable status/code.
     """
-    resp = _graph_call(url, token=token, method=method, data=data, content_type=content_type)
+    if timeout is None:
+        resp = _graph_call(url, token=token, method=method, data=data, content_type=content_type)
+    else:
+        resp = _graph_call(url, token=token, method=method, data=data, content_type=content_type, timeout=timeout)
     if resp.status >= 400:
         raise _graph_error_for(resp, method=method, url=url)
     return resp.json
@@ -1393,6 +1407,8 @@ def deliver_to_sharepoint(
     scope = (os.environ.get("RENDER_SHAREPOINT_LINK_SCOPE") or "organization").strip().lower()
     link_mode = target.link_mode if target is not None else "createLink"
     link_scope: str | None = None
+    link_type: str | None = None
+    scope_check: dict[str, object] | None = None
     if link_mode != "webUrl" and scope not in SHARE_LINK_SCOPES:
         notes.append(
             f"sharing link not minted: RENDER_SHAREPOINT_LINK_SCOPE={scope!r} is not one of "
@@ -1412,11 +1428,35 @@ def deliver_to_sharepoint(
                 _as_str(cast("dict[str, object]", link_obj).get("webUrl")) if isinstance(link_obj, dict) else None
             )
             if link_web:
-                share_url = link_web
-                link_scope = scope
+                permission_id = _as_str(link.get("id"))
+                scope_check = {"status": "not-run", "scope": None, "type": None,
+                               "identity_authorized": False, "reason": "minted permission has no id"}
+                if permission_id:
+                    try:
+                        # One resource, never a paginated census. No grant/revoke and no wider-scope retry.
+                        permission = _graph_request(
+                            f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/permissions/"
+                            f"{urllib_parse.quote(permission_id, safe='')}", token=token, timeout=10,
+                        )
+                        scope_check = check_link_scope(
+                            permission, permission_id=permission_id, expected_scope=scope,
+                            intended=target.intended_recipients if target else (),
+                        )
+                    except (OutputStoreError, OSError, ValueError):
+                        # Never include the provider error: it may contain the sharing URL/token.
+                        scope_check["reason"] = "permission readback unavailable"
+                link_scope = _as_str(scope_check.get("scope"))
+                link_type = _as_str(scope_check.get("type"))
+                if scope_check["status"] == "matched":
+                    share_url = link_web
+                else:
+                    notes.append(
+                        f"sharing permission {scope_check['status']}: {scope_check['reason']}; "
+                        "the returned item URL requires existing access; the minted permission was not revoked"
+                    )
         except OutputStoreError:
             pass  # fall back to the bare driveItem webUrl
-        if link_scope is None:
+        if scope_check is None:
             notes.append(
                 "sharing link could not be minted; the returned URL opens only for "
                 "people who already have access to the item"
@@ -1428,7 +1468,8 @@ def deliver_to_sharepoint(
         "drive_item_web_url": web_url,
         "item_id": item_id,
         "link_scope": link_scope,
-        "link_type": SHARE_LINK_TYPE if link_scope else None,
+        "link_type": link_type,
+        "link_scope_check": scope_check,
         "replaced_etag": replaced.get("etag"),
         "replaced_last_modified_at": replaced.get("last_modified_at"),
         "replaced_existing": replaced.get("existed"),
@@ -1436,6 +1477,57 @@ def deliver_to_sharepoint(
         "guard_failure": guard_failure,
         "notes": notes,
     }
+
+
+def check_link_scope(
+    permission: object, *, permission_id: str, expected_scope: str, intended: Sequence[str] = (),
+) -> dict[str, object]:
+    """Classify a minted permission's GET readback against the requested policy.
+
+    The receipt contains no identity values or bearer URL. A matched anonymous
+    or organization scope is not recipient authorization. For ``users`` the
+    nonempty observed grantees must be a subset of the explicitly intended set.
+    This inspects one minted link only, never the item's inherited/direct ACLs.
+    """
+    result: dict[str, object] = {"status": "not-run", "scope": None, "type": None,
+                                 "identity_authorized": False, "reason": "permission metadata incomplete"}
+    if not isinstance(permission, dict):
+        return result
+    raw = cast("dict[str, object]", permission)
+    link = raw.get("link")
+    if raw.get("id") != permission_id or raw.get("@odata.nextLink") or not isinstance(link, dict):
+        return result
+    meta = cast("dict[str, object]", link)
+    scope, kind, roles = meta.get("scope"), meta.get("type"), raw.get("roles")
+    if (scope not in SHARE_LINK_SCOPES or kind not in ("view", "edit", "embed")
+            or not isinstance(roles, list) or not roles):
+        return result
+    result.update({"scope": scope, "type": kind})
+    if scope != expected_scope or kind != SHARE_LINK_TYPE or roles != ["read"]:
+        result.update({"status": "mismatch", "reason": "actual scope/type/roles differ from requested view access"})
+        return result
+    if scope == "users":
+        grantees = raw.get("grantedToIdentitiesV2", raw.get("grantedToIdentities"))
+        if not intended or not isinstance(grantees, list) or not grantees:
+            result["reason"] = "specific-people recipients or intended set unavailable"
+            return result
+        want = {s.lower() for s in intended}
+        for entry in cast("list[object]", grantees):
+            if not isinstance(entry, dict):
+                return result
+            user = cast("dict[str, object]", entry).get("user")
+            if not isinstance(user, dict):
+                return result
+            identity = cast("dict[str, object]", user)
+            identifiers = [s.lower() for s in (identity.get("email"), identity.get("id")) if isinstance(s, str)]
+            if not identifiers:
+                return result
+            if not want.intersection(identifiers):
+                result.update({"status": "mismatch", "reason": "grantee outside the intended set"})
+                return result
+        result["identity_authorized"] = True
+    result.update({"status": "matched", "reason": "permission readback matches the requested scope and view rights"})
+    return result
 
 
 @dataclass(frozen=True)

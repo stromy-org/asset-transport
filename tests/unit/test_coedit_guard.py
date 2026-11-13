@@ -89,6 +89,7 @@ class _FakeGraph:
         method: str = "GET",
         data: bytes | None = None,
         content_type: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """The raising wrapper: only the unconditional PUT and createLink use it."""
         self.calls.append({"url": url, "method": method, "if_match": None})
@@ -98,7 +99,10 @@ class _FakeGraph:
                 raise O._graph_error_for(resp, method=method, url=url)
             return resp.json
         if method == "POST" and url.endswith("/createLink"):
-            return {"link": {"webUrl": "https://stromy.sharepoint.com/share/abc"}}
+            return {"id": "permission-1", "link": {"webUrl": "https://stromy.sharepoint.com/share/abc"}}
+        if method == "GET" and url.endswith("/permissions/permission-1"):
+            return {"id": "permission-1", "roles": ["read"], "link": {
+                "scope": "organization", "type": "view", "webUrl": "https://stromy.sharepoint.com/share/abc"}}
         return {}
 
     def urlopen(self, request: Any) -> Any:
@@ -144,7 +148,8 @@ class _FakeGraph:
         return [c for c in self.calls if c["method"] == "PUT"]
 
     def metadata_reads(self) -> list[dict[str, Any]]:
-        return [c for c in self.calls if c["method"] == "GET" and ":/versions" not in c["url"]]
+        return [c for c in self.calls if c["method"] == "GET" and ":/versions" not in c["url"]
+                and "/permissions/" not in c["url"]]
 
 
 def _resp(status: int, payload: dict[str, Any]) -> O.GraphResponse:

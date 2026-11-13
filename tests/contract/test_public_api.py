@@ -111,3 +111,10 @@ def test_version_matches_package_metadata() -> None:
     from importlib.metadata import version
 
     assert stromy_asset_transport.__version__ == version("stromy-asset-transport")
+
+
+def test_scope_receipt_and_intended_recipients_are_additive_optional_fields() -> None:
+    assert stromy_asset_transport.DeliveryResult("none", "abc", 0).link_scope_check is None
+    target = stromy_asset_transport.SharePointTarget("site", "drive", "folder", "webUrl")
+    assert target.intended_recipients == ()
+    assert target.link_mode == "webUrl"

@@ -70,7 +70,7 @@ from .publication import (
 )
 from .store import ASSET_CLASSES, AssetStore, AssetStoreError
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 __all__ = [
     "ASSET_CLASSES",
