@@ -30,14 +30,19 @@ and write):
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import secrets
+import shutil
+import tempfile
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .exceptions import DependencyError
 
@@ -53,21 +58,56 @@ _CACHE_MAX_ENTRIES = int(os.environ.get("ASSET_STORE_CACHE_MAX_ENTRIES", "256"))
 _MEM_CACHE_MAX_ENTRIES = int(os.environ.get("ASSET_STORE_MEM_CACHE_MAX_ENTRIES", "64"))
 
 # -- asset class ---------------------------------------------------------------
-# A blob is `brand` (a client's own brand material, kept) or `deliverable` (a
-# client's source material staged for a render, expired after 90 days). The class
-# rides the blob as an Azure **index tag**, not metadata, because only index tags
-# can be filtered on by a storage lifecycle rule (`match_blob_index_tag`) — which
-# is what lets the platform do the expiring instead of a scheduled job of ours.
-# The local-dir backend has no tag concept, so there the class is a `<key>.class`
-# sidecar written under the identical monotonic rule: the whole contract is
-# exercisable in tests with no Azure at all.
+# A blob is `deliverable` (a client's source material staged for a render, expired
+# after 90 days), `brand` (a client's own brand material, kept and proposable) or
+# `library` (ORG-PLAN-592: a brand's heavy original or derivative whose meaning
+# lives in client-data's library.json; kept, never expires, and the store is its
+# canonical copy). The class rides the blob as an Azure **index tag**, not
+# metadata, because only index tags can be filtered on by a storage lifecycle
+# rule (`match_blob_index_tag`) — which is what lets the platform do the expiring
+# instead of a scheduled job of ours. The local-dir backend has no tag concept,
+# so there the class is a `<key>.class` sidecar written under the identical
+# monotonic rule: the whole contract is exercisable in tests with no Azure at all.
 _CLASS_TAG = "asset_class"
 _CLASS_BRAND = "brand"
 _CLASS_DELIVERABLE = "deliverable"
+_CLASS_LIBRARY = "library"
 _CLASS_SIDECAR_SUFFIX = ".class"
-#: The classes the store recognises. `brand` outranks `deliverable`; see
-#: :meth:`AssetStore.put` for the monotonic reconciliation rule.
-ASSET_CLASSES = frozenset({_CLASS_BRAND, _CLASS_DELIVERABLE})
+#: Retention precedence. Reconciliation only ever moves UP this order:
+#: untagged < deliverable < brand < library. A tag value not in this map (a class
+#: introduced by a newer release) is never overwritten by this one.
+CLASS_RANK: dict[str, int] = {_CLASS_DELIVERABLE: 1, _CLASS_BRAND: 2, _CLASS_LIBRARY: 3}
+#: The classes the store recognises. See :meth:`AssetStore.put` for the monotonic
+#: reconciliation rule.
+ASSET_CLASSES = frozenset(CLASS_RANK)
+
+# Streaming I/O (ORG-PLAN-592 A2): files are hashed, uploaded and finalized in
+# bounded chunks so a gigabyte source never sits in memory. Blobs above the
+# inline-cache ceiling are not copied into the process caches either.
+_STREAM_CHUNK = 8 * 1024 * 1024
+_CACHE_INLINE_MAX = int(os.environ.get("ASSET_STORE_CACHE_INLINE_MAX", str(32 * 1024 * 1024)))
+# Tag reconciliation is serialised per blob (Azure: a short lease; local: a file
+# lock) with bounded retry, so two concurrent writers cannot interleave a stale
+# read with a downgrade write.
+_TAG_LEASE_SECONDS = 15
+_TAG_RETRIES = 6
+_TAG_BACKOFF_SECONDS = 0.5
+
+
+def class_outranks(new: str | None, existing: str | None) -> bool:
+    """True when writing ``new`` over ``existing`` moves UP the retention order.
+
+    ``None`` never outranks anything (an unclassified call changes nothing). An
+    existing value this release does not know is treated as outranking every class
+    it does know: an older writer must never overwrite a newer class.
+    """
+    if new is None:
+        return False
+    if existing is None:
+        return True
+    if existing not in CLASS_RANK:
+        return False
+    return CLASS_RANK[new] > CLASS_RANK[existing]
 
 
 class AssetStoreError(RuntimeError):
@@ -168,7 +208,7 @@ class AssetStore:
         caches so an immediate ``fetch`` of the returned handle hits in-process.
         Raises ``AssetStoreError`` on empty input or a missing/failed backend.
 
-        ``asset_class`` (``"brand"`` | ``"deliverable"``) is written as a blob
+        ``asset_class`` (``"deliverable"`` | ``"brand"`` | ``"library"``) is written as a blob
         **index tag** so an Azure lifecycle rule can filter on it — metadata
         cannot be filtered on, tags can. OPTIONAL by design: several live call
         sites store unclassified render artifacts, and an untagged blob is never
@@ -180,8 +220,13 @@ class AssetStore:
 
           * no existing tag      -> write ``asset_class``
           * existing == new      -> no-op
-          * deliverable -> brand -> UPGRADE (set the tag)
-          * brand -> deliverable -> REFUSE SILENTLY (leave ``brand``)
+          * a move UP ``deliverable < brand < library`` -> UPGRADE (set the tag)
+          * any move down        -> REFUSE SILENTLY (keep the higher class)
+          * an existing class this release does not know -> leave it alone
+
+        Unrelated tags on the blob are preserved, and the read-decide-write runs
+        under a per-blob lease (Azure) or file lock (local) with bounded retry, so
+        concurrent writers cannot interleave into a downgrade.
 
         Without the upgrade branch, a picture first seen inside a client's source
         deck and later re-staged as a genuine brand asset keeps ``deliverable``
@@ -197,6 +242,95 @@ class AssetStore:
         self._disk_put(key, data)
         self._mem_put(key, data)
         return key
+
+    def put_file(
+        self,
+        path: str | Path,
+        *,
+        asset_class: str | None = None,
+        expected_sha256: str | None = None,
+    ) -> tuple[str, int]:
+        """Stream a file into the store (PUT-if-absent); return ``(sha256, size)``.
+
+        The bounded-memory twin of :meth:`put` (ORG-PLAN-592 A2): the file is hashed
+        and uploaded in chunks, never read whole, and blobs above the inline-cache
+        ceiling are not copied into the process caches. Same monotonic class rule.
+        ``expected_sha256`` refuses a file whose bytes changed since it was hashed.
+        """
+        _validate_asset_class(asset_class)
+        src = Path(path)
+        key, size = _hash_file(src)
+        if size == 0:
+            raise AssetStoreError(f"refusing to store empty file {src} (no content-addressable handle)")
+        if expected_sha256 is not None and key != expected_sha256.lower():
+            raise AssetStoreError(
+                f"{src} hashes to sha256:{key} but expected sha256:{expected_sha256.lower()} "
+                f"(the file changed after it was inventoried)"
+            )
+        self._backend_put_file(key, src, size)
+        self._reconcile_class(key, asset_class)
+        if size <= _CACHE_INLINE_MAX:
+            raw = src.read_bytes()
+            self._disk_put(key, raw)
+            self._mem_put(key, raw)
+        return key, size
+
+    def describe(self, sha256: str) -> dict[str, Any] | None:
+        """``{"size": int, "asset_class": str | None}`` for a stored blob, else ``None``.
+
+        A HEAD plus a tag read: never downloads. The verify primitive for a manifest
+        that records sizes (ORG-PLAN-592 A3). A backend error RAISES, exactly as
+        :meth:`exists` does: unreachable is never reported as absent.
+        """
+        key = sha256.lower()
+        if not _is_sha256(key):
+            raise ValueError(f"not a valid sha256 handle: {sha256!r}")
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            path = Path(local_dir) / key
+            if not path.is_file():
+                return None
+            return {"size": path.stat().st_size, "asset_class": self._read_class(key)}
+        container = self._read_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for a describe")
+        blob = container.get_blob_client(key)
+        try:
+            if not blob.exists():
+                return None
+            props = blob.get_blob_properties()
+            tags: dict[str, Any] = dict(blob.get_blob_tags() or {})
+        except Exception as e:  # noqa: BLE001 — unreachable is not absent
+            raise AssetStoreError(f"could not describe sha256:{key}: {e}") from e
+        value: Any = tags.get(_CLASS_TAG)
+        return {"size": int(getattr(props, "size", 0) or 0), "asset_class": str(value) if value else None}
+
+    def fetch_to_file(self, sha256: str, dest: str | Path) -> int:
+        """Stream a blob to ``dest`` (atomic replace), verifying its digest; return size.
+
+        Bounded memory: the recovery-cache primitive (ORG-PLAN-592 A2R). A digest
+        mismatch leaves ``dest`` untouched and raises.
+        """
+        key = sha256.lower()
+        if not _is_sha256(key):
+            raise AssetStoreError(f"not a valid sha256 handle: {sha256!r}")
+        target = Path(dest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".fetch-", dir=target.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                self._backend_stream_into(key, fh)
+            actual, size = _hash_file(tmp)
+            if actual != key:
+                raise AssetStoreError(
+                    f"asset integrity check failed: requested sha256:{key} but streamed bytes "
+                    f"hash to sha256:{actual} (corruption)"
+                )
+            tmp.replace(target)
+            return size
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def create_upload_url(self, *, ttl_seconds: int = 3600, content_type: str | None = None) -> dict[str, object]:
         """Mint a pre-authorized WRITE URL for an out-of-band upload to a staging blob.
@@ -254,35 +388,51 @@ class AssetStore:
         if expected_sha256 is not None and not _is_sha256(expected_sha256.lower()):
             raise AssetStoreError(f"not a valid sha256 handle: {expected_sha256!r}")
         _validate_asset_class(asset_class)
-        raw = self._staging_read(blob_key)
-        if not raw:
-            raise AssetStoreError(f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?")
-        key = hashlib.sha256(raw).hexdigest()
-        if expected_sha256 is not None and key != expected_sha256.lower():
-            raise AssetStoreError(
-                f"staged upload {blob_key!r} hashes to sha256:{key} but expected "
-                f"sha256:{expected_sha256.lower()} (corrupt or wrong upload)"
-            )
-        self._backend_put(key, raw)
-        self._reconcile_class(key, asset_class)
-        self._disk_put(key, raw)
-        self._mem_put(key, raw)
+        # Stream the staged blob to a temp file (bounded memory, ORG-PLAN-592 A2):
+        # finalize used to read the whole upload into memory.
+        with self._staging_spool(blob_key) as spooled:
+            if spooled is None:
+                raise AssetStoreError(f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?")
+            key, size = _hash_file(spooled)
+            if size == 0:
+                raise AssetStoreError(f"staged upload {blob_key!r} is missing or empty — was the blob uploaded?")
+            if expected_sha256 is not None and key != expected_sha256.lower():
+                raise AssetStoreError(
+                    f"staged upload {blob_key!r} hashes to sha256:{key} but expected "
+                    f"sha256:{expected_sha256.lower()} (corrupt or wrong upload)"
+                )
+            self._backend_put_file(key, spooled, size)
+            self._reconcile_class(key, asset_class)
+            if size <= _CACHE_INLINE_MAX:
+                raw = spooled.read_bytes()
+                self._disk_put(key, raw)
+                self._mem_put(key, raw)
         self._staging_delete(blob_key)
-        return key, len(raw)
+        return key, size
 
-    def _staging_read(self, blob_key: str) -> bytes | None:
+    @contextlib.contextmanager
+    def _staging_spool(self, blob_key: str) -> Generator[Path | None, None, None]:
+        """Yield a local file holding the staged upload (streamed), or ``None``."""
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
         if local_dir:
             path = Path(local_dir) / _STAGING_PREFIX / blob_key
-            return path.read_bytes() if path.is_file() else None
+            yield path if path.is_file() else None
+            return
         container = self._write_azure_container()
         if container is None:
             raise AssetStoreError("no asset-store backend configured for upload finalize")
+        fd, tmp_name = tempfile.mkstemp(prefix=".staging-")
+        tmp = Path(tmp_name)
         try:
-            blob = container.get_blob_client(f"{_STAGING_PREFIX}/{blob_key}")
-            return blob.download_blob().readall()
-        except Exception:  # noqa: BLE001 — missing staged blob → None (finalize raises)
-            return None
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    container.get_blob_client(f"{_STAGING_PREFIX}/{blob_key}").download_blob().readinto(fh)
+            except Exception:  # noqa: BLE001 — missing staged blob → None (finalize raises)
+                yield None
+                return
+            yield tmp
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _staging_delete(self, blob_key: str) -> None:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
@@ -344,7 +494,7 @@ class AssetStore:
     def _disk_put(self, key: str, raw: bytes) -> None:
         try:
             DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = DISK_CACHE_DIR / f".{key}.tmp"
+            tmp = DISK_CACHE_DIR / f".{key}.{secrets.token_hex(4)}.tmp"
             tmp.write_bytes(raw)
             tmp.replace(DISK_CACHE_DIR / key)
             self._evict_disk()
@@ -404,7 +554,7 @@ class AssetStore:
             d.mkdir(parents=True, exist_ok=True)
             dest = d / key
             if not dest.exists():
-                tmp = d / f".{key}.tmp"
+                tmp = d / f".{key}.{secrets.token_hex(4)}.tmp"
                 tmp.write_bytes(raw)
                 tmp.replace(dest)
             return
@@ -430,6 +580,57 @@ class AssetStore:
             if _blob_already_exists(e):
                 return
             raise AssetStoreError(f"failed to store sha256:{key} to blob backend: {e}") from e
+
+    def _backend_put_file(self, key: str, src: Path, size: int) -> None:
+        """PUT-if-absent from a file, streamed in chunks (never read whole)."""
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            d = Path(local_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            dest = d / key
+            if not dest.exists():
+                tmp = d / f".{key}.{secrets.token_hex(4)}.tmp"
+                with src.open("rb") as fin, tmp.open("wb") as fout:
+                    shutil.copyfileobj(fin, fout, _STREAM_CHUNK)
+                tmp.replace(dest)
+            return
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError(
+                "no asset-store backend configured for write. Set ASSET_STORE_LOCAL_DIR "
+                "(tests/dev), ASSET_STORE_ACCOUNT (managed identity / az login), or "
+                "ASSET_STORE_CONNECTION_STRING."
+            )
+        blob = container.get_blob_client(key)
+        try:
+            if blob.exists():
+                return
+        except Exception:  # noqa: BLE001, S110 - existence probe is best-effort
+            pass
+        try:
+            with src.open("rb") as fh:
+                blob.upload_blob(fh, length=size, overwrite=False, max_concurrency=1)
+        except Exception as e:  # noqa: BLE001
+            if _blob_already_exists(e):
+                return
+            raise AssetStoreError(f"failed to store sha256:{key} to blob backend: {e}") from e
+
+    def _backend_stream_into(self, key: str, fh: BinaryIO) -> None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            path = Path(local_dir) / key
+            if not path.is_file():
+                raise AssetStoreError(f"handle sha256:{key} not found in local store {local_dir}.")
+            with path.open("rb") as fin:
+                shutil.copyfileobj(fin, fh, _STREAM_CHUNK)
+            return
+        container = self._read_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for a streamed fetch")
+        try:
+            container.get_blob_client(key).download_blob().readinto(fh)
+        except Exception as e:  # noqa: BLE001
+            raise AssetStoreError(f"handle sha256:{key} not resolvable from blob store: {e}") from e
 
     def _backend_exists(self, key: str) -> bool:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
@@ -460,18 +661,65 @@ class AssetStore:
         Runs AFTER the PUT-if-absent step, on every call, because ``_backend_put``
         short-circuits on an existing blob — so a tag written only at upload time
         would never reclass a blob the store already holds.
+
+        The read-decide-write is serialised per blob: a file lock on the local
+        backend, a short blob lease on Azure (``set_blob_tags`` under that lease),
+        retried a bounded number of times. Without it two writers can both read
+        "untagged", and the lower class lands last.
         """
         if asset_class is None:
             return
-        existing = self._read_class(key)
-        if existing == asset_class:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            with _local_class_lock(Path(local_dir), key):
+                existing = self._read_class(key)
+                if class_outranks(asset_class, existing):
+                    self._write_class(key, asset_class)
             return
-        if existing == _CLASS_BRAND:
-            # brand -> deliverable is a DOWNGRADE. Refuse silently: a later,
-            # less-informed caller must not be able to schedule a live brand
-            # asset for deletion.
-            return
-        self._write_class(key, asset_class)
+        self._reconcile_class_azure(key, asset_class)
+
+    def _reconcile_class_azure(self, key: str, asset_class: str) -> None:
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for a class write")
+        blob = container.get_blob_client(key)
+        last: Exception | None = None
+        for attempt in range(_TAG_RETRIES):
+            try:
+                lease = blob.acquire_lease(lease_duration=_TAG_LEASE_SECONDS)
+            except Exception as e:  # noqa: BLE001
+                if _lease_conflict(e):
+                    last = e
+                    # Linear backoff with jitter so contending writers do not retry in lockstep.
+                    time.sleep(_TAG_BACKOFF_SECONDS * (attempt + 1) * (0.5 + secrets.randbelow(1000) / 1000))
+                    continue
+                raise AssetStoreError(f"could not lease sha256:{key} to reconcile its class: {e}") from e
+            try:
+                tags: dict[str, str] = {str(k): str(v) for k, v in dict(blob.get_blob_tags() or {}).items()}
+                existing = tags.get(_CLASS_TAG) or None
+                if not class_outranks(asset_class, existing):
+                    return
+                tags[_CLASS_TAG] = asset_class  # merge: unrelated tags are preserved
+                try:
+                    blob.set_blob_tags(tags, lease=lease)
+                except Exception as e:  # noqa: BLE001
+                    raise AssetStoreError(
+                        f"stored sha256:{key} but failed to write its {_CLASS_TAG}="
+                        f"{asset_class!r} index tag: {e}. The blob keeps its previous class "
+                        f"({existing!r}) — this must not pass silently."
+                    ) from e
+                return
+            except AssetStoreError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise AssetStoreError(f"failed to read the class tag of sha256:{key}: {e}") from e
+            finally:
+                with contextlib.suppress(Exception):
+                    lease.release()
+        raise AssetStoreError(
+            f"could not reconcile the class of sha256:{key}: the blob stayed leased by another "
+            f"writer through {_TAG_RETRIES} attempts ({last})"
+        )
 
     def _read_class(self, key: str) -> str | None:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
@@ -497,7 +745,7 @@ class AssetStore:
         if local_dir:
             d = Path(local_dir)
             d.mkdir(parents=True, exist_ok=True)
-            tmp = d / f".{key}{_CLASS_SIDECAR_SUFFIX}.tmp"
+            tmp = d / f".{key}{_CLASS_SIDECAR_SUFFIX}.{secrets.token_hex(4)}.tmp"
             tmp.write_text(asset_class, encoding="utf-8")
             tmp.replace(d / f"{key}{_CLASS_SIDECAR_SUFFIX}")
             return
@@ -530,6 +778,44 @@ class AssetStore:
         self._write_checked = True
         self._write_container = _build_azure_container(read_only=False)
         return self._write_container
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    """Stream ``path`` through sha256 in bounded chunks; return ``(hexdigest, size)``."""
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        while chunk := fh.read(_STREAM_CHUNK):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+@contextlib.contextmanager
+def _local_class_lock(root: Path, key: str) -> Generator[None, None, None]:
+    """Exclusive per-blob lock for the local backend's class sidecar."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / f".{key}{_CLASS_SIDECAR_SUFFIX}.lock"
+    with lock_path.open("a+") as fh:
+        try:
+            import fcntl  # POSIX; the local backend is a dev/test backend
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except ImportError:  # pragma: no cover - non-POSIX dev box
+            pass
+        try:
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _lease_conflict(exc: Exception) -> bool:
+    """True when a lease could not be taken because another writer holds one."""
+    text = f"{type(exc).__name__} {exc}"
+    return "LeaseAlreadyPresent" in text or "There is already a lease present" in text
 
 
 def _blob_already_exists(exc: Exception) -> bool:

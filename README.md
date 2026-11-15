@@ -27,10 +27,18 @@ if store.exists(sha): ...            # -> bool, never downloads; a backend error
                                      #    (a store we cannot reach is not "absent")
 
 # Optional asset class, written as a blob INDEX TAG so a storage lifecycle rule can
-# filter on it. MONOTONIC: deliverable → brand upgrades even on a blob already in the
-# store; brand → deliverable is refused silently. Omit it and the blob stays untagged —
-# and an untagged blob is never expired, by construction.
+# filter on it. MONOTONIC: untagged < deliverable < brand < library. A move up always
+# applies (even on a blob already in the store); a move down is refused silently; a
+# class this release does not know is left alone. Unrelated tags are preserved and the
+# read-decide-write runs under a per-blob lease (Azure) or file lock (local). Omit it
+# and the blob stays untagged — and an untagged blob is never expired, by construction.
 store.put(logo_bytes, asset_class="brand")
+
+# Large files stream in bounded chunks (never read whole). `library` is the durable
+# class for a brand's heavy originals recorded in client-data's library.json.
+sha, size = store.put_file("raw/figma.json", asset_class="library", expected_sha256=sha)
+store.describe(sha)                  # -> {"size": int, "asset_class": str | None} | None
+store.fetch_to_file(sha, "cache/x")  # streamed, digest-verified, atomic replace
 
 # Outbound: URLs/handles out, not raw blobs. One ladder, four modes.
 result = deliver_artifact(
