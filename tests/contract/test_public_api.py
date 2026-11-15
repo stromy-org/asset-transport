@@ -118,3 +118,12 @@ def test_scope_receipt_and_intended_recipients_are_additive_optional_fields() ->
     target = stromy_asset_transport.SharePointTarget("site", "drive", "folder", "webUrl")
     assert target.intended_recipients == ()
     assert target.link_mode == "webUrl"
+
+
+@pytest.mark.contract
+def test_library_class_public_api_present() -> None:
+    """ORG-PLAN-592: consumers gate library promotion on these."""
+    for symbol in ("ASSET_CLASSES", "CLASS_RANK", "class_outranks"):
+        assert symbol in stromy_asset_transport.__all__
+        assert hasattr(stromy_asset_transport, symbol)
+    assert "library" in stromy_asset_transport.ASSET_CLASSES

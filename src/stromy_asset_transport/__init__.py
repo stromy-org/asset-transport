@@ -68,12 +68,13 @@ from .publication import (
     mint_download_url,
     publish_artifact,
 )
-from .store import ASSET_CLASSES, AssetStore, AssetStoreError
+from .store import ASSET_CLASSES, CLASS_RANK, AssetStore, AssetStoreError, class_outranks
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 
 __all__ = [
     "ASSET_CLASSES",
+    "CLASS_RANK",
     "CONFLICT_REASONS",
     "DEFAULT_COMPARE_READ_MAX_BYTES",
     "DEFAULT_READ_MAX_BYTES",
@@ -98,6 +99,7 @@ __all__ = [
     "UnsafePath",
     "WorkspaceStorageError",
     "cancel_upload_session",
+    "class_outranks",
     "create_file_once",
     "deliver",
     "deliver_artifact",
