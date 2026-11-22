@@ -8,6 +8,8 @@ Ported from stromy-format-mcp's test_asset_store.py + new put() coverage.
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -118,6 +120,61 @@ def test_put_is_idempotent(store):
     sha2 = s.put(raw)
     assert sha1 == sha2
     assert (backend / sha1).read_bytes() == raw
+
+
+def test_verified_upload_adds_durable_access_without_duplicating_content(store):
+    s, backend = store
+    raw = b"document uploaded to a sandbox workspace"
+    digest = s.put(raw)
+    assert s.has_access(digest, scope="sandbox") is False
+
+    assert s.put(raw, scope="sandbox") == digest
+    assert A.AssetStore().has_access(digest.upper(), scope="sandbox")
+    assert not A.AssetStore().has_access(digest, scope="elsewhere")
+    assert list(backend.glob(digest)) == [backend / digest]
+
+
+def test_a_binding_check_only_probes_the_marker(store, monkeypatch):
+    s, _ = store
+    digest = s.put(b"known content", scope="sandbox")
+    probes = []
+
+    def backend_check(key):
+        probes.append(key)
+        raise A.AssetStoreError("storage unavailable")
+
+    monkeypatch.setattr(s, "_backend_exists", backend_check)
+    with pytest.raises(A.AssetStoreError, match="storage unavailable"):
+        s.has_access(digest, scope="sandbox")
+    assert len(probes) == 1
+    assert probes[0].startswith("asset-access/v1/")
+    assert probes[0].endswith(f"/{digest}")
+
+
+def test_finalize_keeps_staged_bytes_when_access_binding_needs_retry(store, monkeypatch):
+    s, _ = store
+    upload = s.create_upload_url()
+    blob_key = str(upload["blob_key"])
+    staged = Path(unquote(urlsplit(str(upload["upload_url"])).path))
+    raw = b"original upload bytes"
+    staged.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+
+    def write_failed(_key):
+        raise A.AssetStoreError("access binding write failed")
+
+    with monkeypatch.context() as transient:
+        transient.setattr(s, "_write_access_marker", write_failed)
+        with pytest.raises(A.AssetStoreError, match="access binding write failed"):
+            s.finalize_upload(blob_key, expected_sha256=digest, scope="sandbox")
+    assert staged.read_bytes() == raw
+    assert not s.has_access(digest, scope="sandbox")
+    assert s.finalize_upload(blob_key, expected_sha256=digest, scope="sandbox") == (
+        digest,
+        len(raw),
+    )
+    assert not staged.exists()
+    assert A.AssetStore().has_access(digest, scope="sandbox")
 
 
 def test_put_empty_raises(store):

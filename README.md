@@ -208,6 +208,20 @@ uv run pytest tests/unit
 uv run pytest tests/contract
 ```
 
+## Durable access bindings
+
+Services can pass `scope=` to `AssetStore.put()` and `AssetStore.finalize_upload()`
+after authenticating the uploader and verifying its authority over the scope.
+The store writes one durable access marker for that scope and digest after the
+content and its retention class have been written. A failed marker write keeps
+a browser upload available for retry. Identical bytes still share one blob.
+
+Call `AssetStore.has_access(sha256, scope=...)` before reading a handle received
+from a scoped caller. Derive `scope` from verified identity or a server-owned
+workspace binding. The check reads only the access marker. Existing unscoped
+writes create no marker. A service can bind an older asset by supplying bytes
+read from a verified workspace file to `put()` with the same verified scope.
+
 ## Releases
 
 This library is consumed by downstream repos via `[tool.uv.sources]` git+URL pins. To cut a release:

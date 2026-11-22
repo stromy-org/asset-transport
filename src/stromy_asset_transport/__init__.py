@@ -70,7 +70,7 @@ from .publication import (
 )
 from .store import ASSET_CLASSES, CLASS_RANK, AssetStore, AssetStoreError, class_outranks
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 __all__ = [
     "ASSET_CLASSES",
