@@ -8,12 +8,11 @@ tool call (the ~140 KB output-token ceiling). This is the domain-agnostic
 extraction of ``stromy-format-mcp``'s ``asset_store.py`` (read) +
 ``scripts/asset_store_upload.py`` (write half), shared by every Stromy MCP.
 
-Content-addressing, not tenant partitioning: the key is purely ``sha256(bytes)``.
-The store never learns which client a hash belongs to, identical assets across
-clients dedupe to one blob, and an asset update yields a new hash (automatic
-cache invalidation). Tenant scoping, when needed, is enforced by the *caller*
-(e.g. the asset-broker staging ledger), never baked into the store key — see
-:func:`stromy_asset_transport.keys.tenant_key`.
+The content key is ``sha256(bytes)``, so identical assets share one blob. A
+service may bind bytes it has verified to an authenticated scope at upload time.
+Separate durable markers record those bindings. Each service chooses the scope
+from verified identity or workspace authority and checks it before resolving a
+handle from a request.
 
 **No silent downgrade.** A handle the store cannot resolve is a hard
 ``AssetStoreError``; callers translate it to their own error with a "repopulate
@@ -51,6 +50,7 @@ DEFAULT_CONTAINER = "brand-assets"
 # their content-addressed key. Kept separate so a staged-but-unfinalized blob is
 # never mistaken for a resolvable handle.
 _STAGING_PREFIX = ".staging"
+_ACCESS_PREFIX = "asset-access/v1"
 DISK_CACHE_DIR = Path(os.environ.get("ASSET_STORE_CACHE_DIR", "/tmp/stromy-asset-cache"))  # noqa: S108
 # Bound the per-replica disk cache so a long-lived replica does not grow without
 # limit. Hot assets stay; cold ones are evicted LRU. Tunable via env.
@@ -120,6 +120,15 @@ class AssetStoreError(RuntimeError):
 
 def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def _access_key(scope: str, sha256: str) -> str:
+    if not scope or scope != scope.strip() or len(scope) > 200:
+        raise ValueError("scope must be a non-empty canonical identifier of at most 200 characters")
+    if not _is_sha256(sha256):
+        raise ValueError("an asset binding requires a valid sha256 handle")
+    scope_digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return f"{_ACCESS_PREFIX}/{scope_digest}/{sha256.lower()}"
 
 
 def _validate_asset_class(asset_class: str | None) -> None:
@@ -201,12 +210,24 @@ class AssetStore:
             return True
         return self._backend_exists(key)
 
-    def put(self, data: bytes, *, asset_class: str | None = None) -> str:
+    def has_access(self, sha256: str, *, scope: str) -> bool:
+        """Check a durable scope binding without accessing the content blob.
+
+        The service derives ``scope`` from trusted identity or workspace data.
+        An absent binding returns False. An unavailable backend raises.
+        """
+        return self._backend_exists(_access_key(scope, sha256))
+
+    def put(
+        self, data: bytes, *, asset_class: str | None = None, scope: str | None = None
+    ) -> str:
         """Store ``data`` keyed by its sha256 (PUT-if-absent); return the handle.
 
         Idempotent: storing the same bytes twice writes once. Populates the local
         caches so an immediate ``fetch`` of the returned handle hits in-process.
         Raises ``AssetStoreError`` on empty input or a missing/failed backend.
+        Pass a verified ``scope`` to bind the supplied bytes to it after the
+        content write and class check have succeeded.
 
         ``asset_class`` (``"deliverable"`` | ``"brand"`` | ``"library"``) is written as a blob
         **index tag** so an Azure lifecycle rule can filter on it — metadata
@@ -236,8 +257,11 @@ class AssetStore:
             raise AssetStoreError("refusing to store empty bytes (no content-addressable handle)")
         _validate_asset_class(asset_class)
         key = hashlib.sha256(data).hexdigest()
+        access_key = _access_key(scope, key) if scope is not None else None
         self._backend_put(key, data)
         self._reconcile_class(key, asset_class)
+        if access_key is not None:
+            self._write_access_marker(access_key)
         # Warm the caches so a fetch in the same process resolves without a round-trip.
         self._disk_put(key, data)
         self._mem_put(key, data)
@@ -372,6 +396,7 @@ class AssetStore:
         *,
         expected_sha256: str | None = None,
         asset_class: str | None = None,
+        scope: str | None = None,
     ) -> tuple[str, int]:
         """Move a staged out-of-band upload into the content-addressed store.
 
@@ -384,6 +409,8 @@ class AssetStore:
         monotonic rule, same helper. The browser-upload path never calls ``put``,
         so without this keyword every handle minted through an upload link would
         reach the store untagged and outside the lifecycle rule's reach.
+        With a verified ``scope``, persist the binding before deleting the upload
+        so a failed binding write can be retried against the same staged bytes.
         """
         if expected_sha256 is not None and not _is_sha256(expected_sha256.lower()):
             raise AssetStoreError(f"not a valid sha256 handle: {expected_sha256!r}")
@@ -401,8 +428,11 @@ class AssetStore:
                     f"staged upload {blob_key!r} hashes to sha256:{key} but expected "
                     f"sha256:{expected_sha256.lower()} (corrupt or wrong upload)"
                 )
+            access_key = _access_key(scope, key) if scope is not None else None
             self._backend_put_file(key, spooled, size)
             self._reconcile_class(key, asset_class)
+            if access_key is not None:
+                self._write_access_marker(access_key)
             if size <= _CACHE_INLINE_MAX:
                 raw = spooled.read_bytes()
                 self._disk_put(key, raw)
@@ -519,6 +549,25 @@ class AssetStore:
                 pass
 
     # -- backends -------------------------------------------------------------
+
+    def _write_access_marker(self, key: str) -> None:
+        local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
+        if local_dir:
+            path = Path(local_dir) / key
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch(exist_ok=True)
+            except OSError as exc:
+                raise AssetStoreError("could not persist the asset access binding") from exc
+            return
+        container = self._write_azure_container()
+        if container is None:
+            raise AssetStoreError("no asset-store backend configured for the access binding")
+        try:
+            container.get_blob_client(key).upload_blob(b"", overwrite=False)
+        except Exception as exc:  # noqa: BLE001 - only an existing immutable marker is a success
+            if not _blob_already_exists(exc):
+                raise AssetStoreError("could not persist the asset access binding") from exc
 
     def _backend_fetch(self, key: str) -> bytes:
         local_dir = os.environ.get("ASSET_STORE_LOCAL_DIR")
